@@ -1,0 +1,95 @@
+{
+	"name": "omp-advisor-consensus",
+	"version": "0.1.0",
+	"description": "Adversarial advisor convergence loop: reprompt and steer the agent on advisor findings until both agree and every item is closed",
+	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/alosslessdev/omp-advisor-consensus.git"
+	},
+	"homepage": "https://github.com/alosslessdev/omp-advisor-consensus#readme",
+	"bugs": {
+		"url": "https://github.com/alosslessdev/omp-advisor-consensus/issues"
+	},
+	"keywords": [
+		"omp",
+		"oh-my-pi",
+		"plugin",
+		"extension",
+		"advisor",
+		"watchdog",
+		"convergence",
+		"ralph-loop",
+		"review"
+	],
+	"files": [
+		"extensions/",
+		"README.md",
+		"LICENSE",
+		".omp-plugin/"
+	],
+	"omp": {
+		"description": "Turn unanswered advisor findings into a bounded adversarial loop: reprompt the agent, re-review, repeat until the advisor is silent and the agent claims closure",
+		"extensions": [
+			"./extensions/consensus.ts"
+		],
+		"settings": {
+			"enabled": {
+				"type": "boolean",
+				"default": false,
+				"description": "Arm the convergence loop. Off by default; arm per session with /converge on or durably with `omp plugin config --set enabled=true`."
+			},
+			"minSeverity": {
+				"type": "enum",
+				"values": [
+					"nit",
+					"concern",
+					"blocker"
+				],
+				"default": "nit",
+				"description": "Lowest advisor finding severity that keeps the loop running."
+			},
+			"maxRounds": {
+				"type": "number",
+				"default": 4,
+				"min": 1,
+				"max": 6,
+				"step": 1,
+				"description": "Continuation turns this plugin may spend on one user prompt (host caps session_stop continuations at 8)."
+			},
+			"maxRepeats": {
+				"type": "number",
+				"default": 2,
+				"min": 1,
+				"max": 5,
+				"step": 1,
+				"description": "Times the advisor may re-raise the same finding before the loop escalates to the operator."
+			},
+			"forceSyncBacklog": {
+				"type": "boolean",
+				"default": true,
+				"description": "Pin advisor.syncBacklog to strict while the loop is armed, so an empty review really means agreement."
+			},
+			"useSessionModel": {
+				"type": "boolean",
+				"default": true,
+				"description": "Default the advisor's model to the session's live model instead of the advisor role's slow chain. An explicitly configured modelRoles.advisor or WATCHDOG model still wins."
+			},
+			"notify": {
+				"type": "boolean",
+				"default": true,
+				"description": "Toast each round, convergence, and escalation."
+			}
+		}
+	},
+	"scripts": {
+		"test": "bun test",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@oh-my-pi/pi-coding-agent": "^19.0.0",
+		"@types/bun": "^1.2.0",
+		"typescript": "^5.9.0"
+	}
+}

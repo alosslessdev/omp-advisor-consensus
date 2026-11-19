@@ -1,0 +1,32 @@
+{
+	"name": "omp-advisor-consensus",
+	"owner": {
+		"name": "alosslessdev",
+		"url": "https://github.com/alosslessdev"
+	},
+	"metadata": {
+		"description": "Adversarial advisor convergence for omp: bounded reprompt/steer loop until advisor and agent agree",
+		"version": "0.1.0"
+	},
+	"plugins": [
+		{
+			"name": "advisor-consensus",
+			"source": "./",
+			"description": "Turns unanswered advisor findings into continuation turns and re-reviews until the advisor is silent and the agent claims closure. Adds /adversarial (on / off / pause / resume) and a per-prompt convergence ledger.",
+			"category": "productivity",
+			"version": "0.1.0",
+			"author": {
+				"name": "alosslessdev"
+			},
+			"homepage": "https://github.com/alosslessdev/omp-advisor-consensus",
+			"repository": "https://github.com/alosslessdev/omp-advisor-consensus",
+			"license": "MIT",
+			"keywords": [
+				"advisor",
+				"convergence",
+				"review",
+				"watchdog"
+			]
+		}
+	]
+}
