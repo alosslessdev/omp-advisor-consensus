@@ -38,7 +38,7 @@
 			"enabled": {
 				"type": "boolean",
 				"default": false,
-				"description": "Arm the convergence loop. Off by default; arm per session with /converge on or durably with `omp plugin config --set enabled=true`."
+				"description": "Arm the convergence loop. Off by default; arm per session with /adversarial on or durably with `omp plugin config --set enabled=true`."
 			},
 			"minSeverity": {
 				"type": "enum",
