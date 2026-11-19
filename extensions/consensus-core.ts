@@ -488,6 +488,11 @@ export function buildEscalationNotice(
 	return `${header} ${findings.length} finding(s) still open:\n${list}`;
 }
 
+/** Transient notice when the loop is armed but no advisor can produce findings. */
+export function buildMissingAdvisorNotice(): string {
+	return "advisor-consensus: advisor subsystem is off, so no findings can arrive. Run /advisor on (or set advisor.enabled: true) — the loop starts reacting at the next settle.";
+}
+
 /** Convergence notice for the operator. */
 export function buildConvergedNotice(round: number, viaStopCall = false): string {
 	if (viaStopCall) return "advisor-consensus: advisor called stop — loop closed.";

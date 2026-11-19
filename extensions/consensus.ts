@@ -33,6 +33,7 @@ import {
 	lastAssistantAnswer,
 	buildConvergedNotice,
 	buildEscalationNotice,
+	buildMissingAdvisorNotice,
 	buildRemediationPrompt,
 	decideAtStop,
 	DEFAULT_CONFIG,
@@ -433,12 +434,12 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 			}
 			return;
 		}
-		if (state.advisorEnabled === false && !state.warnedMissingAdvisor) {
-			state.warnedMissingAdvisor = true;
-			ctx.ui.notify(
-				"advisor-consensus: advisor subsystem is off. Enable `advisor.enabled` (or run `/advisor on`) — this plugin only loops on advisor findings.",
-				"warning",
-			);
+		if (state.advisorEnabled === false) {
+			pi.logger.debug("advisor-consensus armed without advisor", { source: "session_start" });
+			if (!state.warnedMissingAdvisor) {
+				state.warnedMissingAdvisor = true;
+				ctx.ui.notify(buildMissingAdvisorNotice(), "warning");
+			}
 			return;
 		}
 		if (state.advisorEnabled === true && config.forceSyncBacklog && state.syncPolicy !== "strict") {
@@ -583,7 +584,14 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 		const config = effectiveConfig(ctx.cwd, state);
 
 		if (!config.enabled || state.paused) return;
+		const advisorWasOff = state.advisorEnabled === false;
 		const host = refreshAdvisorState(pi, state);
+		if (advisorWasOff && state.advisorEnabled === true) {
+			pi.logger.debug("advisor-consensus advisor came online");
+			if (config.notify) {
+				ctx.ui.notify("advisor-consensus: advisor detected — findings now drive the loop.", "info");
+			}
+		}
 		if (state.advisorEnabled === false) return;
 		if (ctx.sessionModes?.getState().plan.status === "active") return;
 		if (state.advisorEnabled === true && config.forceSyncBacklog && state.syncPolicy !== "strict") {
@@ -658,12 +666,19 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 				state.overrideEnabled = true;
 				state.paused = false;
 				pi.appendEntry(ARM_TYPE, { armed: true });
+				refreshAdvisorState(pi, state);
 				const config = effectiveConfig(ctx.cwd, state);
 				updateStatus(ctx, state, config, "armed");
 				ctx.ui.notify(
 					`advisor-consensus: adversarial loop on · ${config.maxRounds} rounds · repeats ${config.maxRepeats}`,
 					"info",
 				);
+				if (state.advisorEnabled === false) {
+					// Arming without a reviewer cannot produce a single finding: say so
+					// now, as a transient toast, instead of looking broken later.
+					pi.logger.debug("advisor-consensus armed without advisor", { source: "command" });
+					ctx.ui.notify(buildMissingAdvisorNotice(), "warning");
+				}
 			};
 
 			const disable = (): void => {

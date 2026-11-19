@@ -51,6 +51,11 @@ once per session when the advisor is off.
 /adversarial sync off     # release the advisor.syncBacklog pin
 ```
 
+Arming without a working advisor cannot produce a single finding, so the plugin
+says so immediately with a transient toast (and again once per session at
+startup): enable `/advisor on` or `advisor.enabled: true`. It also announces the
+moment the advisor comes online, so the loop visibly starts reacting.
+
 Arming is recorded in the session transcript, so `/adversarial on` survives
 `omp --resume`. The plugin also re-reads `advisor.enabled` at every settle, so
 `/advisor on` mid-session is picked up without a restart.
