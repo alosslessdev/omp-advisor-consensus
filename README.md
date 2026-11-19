@@ -42,19 +42,34 @@ once per session when the advisor is off.
 /adversarial resume       # continue the same episode
 /adversarial off          # disarm and cancel the in-flight episode
 /adversarial status       # mode, advisor, config, sync policy, round, converged count
-/adversarial max 3        # rounds for this session (1..6)
+/adversarial config       # TUI editor for rounds, repeats, severity, notify, sync, model
+/adversarial max 12       # rounds for this session (1..100)
+/adversarial repeats 4    # re-raises of one finding before escalation (1..10)
 /adversarial severity concern
 /adversarial model session     # default: advisor runs the session's live model
 /adversarial model configured  # use modelRoles.advisor / the WATCHDOG entry model
 /adversarial sync off     # release the advisor.syncBacklog pin
 ```
 
-Durable arming goes through normal plugin settings:
+`/adversarial config` opens a TUI editor for the live values; the same numbers
+can be passed inline (`max`, `repeats`, `severity`) or set durably through
+plugin settings:
 
 ```bash
 omp plugin config --set enabled=true            # ~/.omp/plugins/omp-plugins.lock.json
-omp plugin config --set maxRounds=3
+omp plugin config --set maxRounds=12
+omp plugin config --set maxRepeats=4
 omp plugin config --set minSeverity=concern
+```
+
+While the loop is armed, the status line next to the message box keeps showing
+the effective configuration and the live round:
+
+```text
+adversarial on · 100 rounds · repeats 3
+adversarial 4/100 · 2 open
+adversarial paused · 4/100
+adversarial converged · 4/100
 ```
 
 `off` is not `pause`: off writes a `settled: "cancelled"` marker for the active
@@ -151,8 +166,8 @@ rebuttal needs evidence the advisor has not already rejected.
 | --- | --- | --- |
 | `enabled` | `false` | Arm the loop. Off until you turn it on. |
 | `minSeverity` | `nit` | Lowest finding severity that keeps the loop running. |
-| `maxRounds` | `4` | Continuations per user prompt (clamped to 1..6). |
-| `maxRepeats` | `2` | Re-raises of the same finding before escalation. |
+| `maxRounds` | `100` | Continuations per user prompt (configurable 1..100). |
+| `maxRepeats` | `3` | Re-raises of the same finding before escalation (1..10). |
 | `forceSyncBacklog` | `true` | Pin `advisor.syncBacklog: strict` while armed. |
 | `useSessionModel` | `true` | Default the advisor to the session's live model. |
 | `notify` | `true` | Toast per round, convergence, and escalation. |
@@ -188,9 +203,14 @@ session.
 
 ## Limits
 
-- `session_stop` continuations are capped by the host at 8 per user prompt; the
-  advisor's own continuations spend from that budget too, so `maxRounds` is
-  clamped to 6.
+- Rounds 1-6 ride the host's `session_stop` continuation (capped at 8 per
+  prompt, shared with advisor continuations). Later rounds are steered from
+  `agent_end` as agent-initiated turns, which is what lets `maxRounds` reach
+  100. Verified headless: rounds 1-6 arrive as `session-stop-continuation`, round
+  7 onward as an `advisor-consensus` turn. A process that is already disposing
+  can drop the final steered turn.
+- A 100-round budget is a ceiling, not a target: each round is one agent turn
+  plus one advisor review. `maxRepeats` usually ends a deadlock far sooner.
 - `syncBacklog: strict` makes every reviewed turn wait for its advisor review.
   That is the price of a trustworthy "silence means agreement"; `/adversarial
   sync off` opts out and accepts that a late note starts a new episode.
@@ -221,7 +241,7 @@ budget and a resumed session continues an interrupted episode.
 
 ```bash
 bun install
-bun test          # 28 tests: decision core + host wiring
+bun test          # 31 tests: decision core + host wiring
 bun run typecheck
 ```
 

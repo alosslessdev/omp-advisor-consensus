@@ -60,19 +60,19 @@ export const DEFAULT_CONFIG: ConsensusConfig = {
 	/** Opt-in: the loop only runs after the user arms it. */
 	enabled: false,
 	minSeverity: "nit",
-	maxRounds: 4,
-	maxRepeats: 2,
+	maxRounds: 100,
+	maxRepeats: 3,
 	forceSyncBacklog: true,
 	useSessionModel: true,
 	notify: true,
 };
 
 /**
- * The host caps `session_stop` continuations at 8 per user prompt and the
- * advisor's own continuations spend from the same budget, so the plugin never
- * plans more than 6 itself.
+ * Upper bound for `maxRounds`. Rounds are driven by steered turns rather than
+ * `session_stop` continuations (the host caps those at 8 per prompt), so a very
+ * long adversarial exchange is possible; the cap is only a sanity limit.
  */
-export const MAX_ROUNDS_CEILING = 6;
+export const MAX_ROUNDS_CEILING = 100;
 
 export interface AdvisorFinding {
 	/** Note text, exactly as the advisor wrote it. */
@@ -542,7 +542,7 @@ export function resolveConfig(
 			? (severity as Severity)
 			: DEFAULT_CONFIG.minSeverity,
 		maxRounds: asInteger(merged.maxRounds, 1, MAX_ROUNDS_CEILING) ?? DEFAULT_CONFIG.maxRounds,
-		maxRepeats: asInteger(merged.maxRepeats, 1, 5) ?? DEFAULT_CONFIG.maxRepeats,
+		maxRepeats: asInteger(merged.maxRepeats, 1, 10) ?? DEFAULT_CONFIG.maxRepeats,
 		forceSyncBacklog: booleanish(merged.forceSyncBacklog) ?? DEFAULT_CONFIG.forceSyncBacklog,
 		useSessionModel: booleanish(merged.useSessionModel) ?? DEFAULT_CONFIG.useSessionModel,
 		notify: booleanish(merged.notify) ?? DEFAULT_CONFIG.notify,

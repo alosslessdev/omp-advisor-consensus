@@ -351,7 +351,7 @@ describe("configuration", () => {
 			{},
 		);
 		expect(fromSettings).toMatchObject({
-			maxRounds: 6,
+			maxRounds: 99,
 			minSeverity: "blocker",
 			enabled: false,
 			forceSyncBacklog: false,

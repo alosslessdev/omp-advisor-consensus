@@ -52,17 +52,17 @@
 			},
 			"maxRounds": {
 				"type": "number",
-				"default": 4,
+				"default": 100,
 				"min": 1,
-				"max": 6,
+				"max": 100,
 				"step": 1,
-				"description": "Continuation turns this plugin may spend on one user prompt (host caps session_stop continuations at 8)."
+				"description": "Continuation turns this plugin may spend on one user prompt."
 			},
 			"maxRepeats": {
 				"type": "number",
-				"default": 2,
+				"default": 3,
 				"min": 1,
-				"max": 5,
+				"max": 10,
 				"step": 1,
 				"description": "Times the advisor may re-raise the same finding before the loop escalates to the operator."
 			},
