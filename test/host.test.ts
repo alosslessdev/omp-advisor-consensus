@@ -177,7 +177,7 @@ describe("host wiring", () => {
 		expect(result.additionalContext).toContain("1. [concern] missing test");
 		expect(host.sent).toHaveLength(0);
 
-		expect(host.appended).toEqual([
+		expect(host.appended.filter(entry => entry.type === "advisor-consensus")).toEqual([
 			{ type: "advisor-consensus", data: { v: 1, anchor: "u1", round: 1, seen: { "missing test": 1 } } },
 		]);
 		expect(host.statuses.at(-1)).toEqual(["advisor-consensus", "adversarial 1/100 · 1 open"]);
@@ -195,6 +195,38 @@ describe("host wiring", () => {
 		await host.commands.get("adversarial")!.handler("max 12", host.ctx);
 		await host.commands.get("adversarial")!.handler("repeats 5", host.ctx);
 		expect(host.statuses.at(-1)?.[1]).toBe("adversarial on · 12 rounds · repeats 5");
+	});
+
+	it("re-arms from the transcript after a resume", async () => {
+		const branch = [
+			user("u1"),
+			{ type: "custom", id: "arm1", parentId: null, timestamp: TS, customType: "advisor-consensus-arm", data: { armed: true } },
+			assistant("a1", "done"),
+			advisorNote("n1", "missing test", "concern"),
+		];
+		const host = createHost(branch);
+		advisorConsensus(host.api);
+		await host.emit("session_start", {});
+
+		// No `/adversarial on` in this process: the branch says it was armed.
+		const result = (await host.emit("session_stop", stopEvent)) as { continue?: boolean };
+		expect(result.continue).toBe(true);
+		expect(host.statuses.at(-1)?.[1]).toBe("adversarial 1/100 · 1 open");
+	});
+
+	it("stays off after a resume when the transcript says it was turned off", async () => {
+		const branch = [
+			user("u1"),
+			{ type: "custom", id: "arm1", parentId: null, timestamp: TS, customType: "advisor-consensus-arm", data: { armed: false } },
+			assistant("a1", "done"),
+			advisorNote("n1", "missing test", "concern"),
+		];
+		const host = createHost(branch);
+		advisorConsensus(host.api);
+		await host.emit("session_start", {});
+
+		expect(await host.emit("session_stop", stopEvent)).toBeUndefined();
+		expect(host.sent).toHaveLength(0);
 	});
 
 	it("settles once the advisor is silent and records the converged episode", async () => {
@@ -236,12 +268,12 @@ describe("host wiring", () => {
 		await command.handler("pause", host.ctx);
 		expect(host.statuses.at(-1)?.[1]).toBe("adversarial paused · 0/100");
 		expect(await host.emit("session_stop", stopEvent)).toBeUndefined();
-		expect(host.appended).toHaveLength(0);
+		expect(host.appended.filter(entry => entry.type === "advisor-consensus")).toHaveLength(0);
 
 		await command.handler("resume", host.ctx);
 		const result = (await host.emit("session_stop", stopEvent)) as { continue?: boolean };
 		expect(result.continue).toBe(true);
-		expect(host.appended).toHaveLength(1);
+		expect(host.appended.filter(entry => entry.type === "advisor-consensus")).toHaveLength(1);
 	});
 
 	it("cancels an in-flight episode when turned off", async () => {
@@ -254,11 +286,15 @@ describe("host wiring", () => {
 		await command.handler("on", host.ctx);
 		await command.handler("off", host.ctx);
 
-		expect(host.appended).toEqual([
+		expect(host.appended.filter(entry => entry.type === "advisor-consensus")).toEqual([
 			{
 				type: "advisor-consensus",
 				data: { v: 1, anchor: "u1", round: 2, seen: {}, settled: "cancelled" },
 			},
+		]);
+		expect(host.appended.filter(entry => entry.type === "advisor-consensus-arm")).toEqual([
+			{ type: "advisor-consensus-arm", data: { armed: true } },
+			{ type: "advisor-consensus-arm", data: { armed: false } },
 		]);
 		expect(host.notifications.at(-1)?.message).toContain("cancelled mid-episode (round 2)");
 		expect(host.statuses.at(-1)?.[1]).toBeUndefined();

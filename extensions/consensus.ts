@@ -51,6 +51,8 @@ import {
 /** Package name and marketplace plugin name both key plugin settings in the lockfile. */
 const SETTING_KEYS = ["omp-advisor-consensus", "advisor-consensus"] as const;
 const STATUS_KEY = "advisor-consensus";
+/** Session entry recording whether the user armed the loop (survives resume). */
+const ARM_TYPE = "advisor-consensus-arm";
 /**
  * A note the advisor emits after the loop settled is the one class the host
  * cannot convert into a turn itself (print mode refuses, and a preserved card
@@ -254,6 +256,22 @@ function advisorSettings(): {
 	return { enabled, sync, roles };
 }
 
+/**
+ * Last `/adversarial on|off` decision recorded in the branch. Session-scoped
+ * arming is otherwise lost on `--resume`, which makes the loop look broken in a
+ * session the user had already turned on.
+ */
+function readArmState(entries: readonly SessionEntry[]): boolean | undefined {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index]!;
+		if (entry.type !== "custom" || entry.customType !== ARM_TYPE) continue;
+		const data = entry.data;
+		if (typeof data !== "object" || data === null || !("armed" in data)) return undefined;
+		return typeof data.armed === "boolean" ? data.armed : undefined;
+	}
+	return undefined;
+}
+
 /** Current `modelRoles` record, narrowed from the settings scope. */
 function readModelRoles(handle: SettingHandle, scope: unknown): Record<string, string> {
 	const roles: Record<string, string> = {};
@@ -325,6 +343,23 @@ function statusLine(
 	}
 }
 
+/**
+ * Re-read `advisor.enabled` / `advisor.syncBacklog` from the live settings.
+ * Caching them from `session_start` left the plugin silently inert when the
+ * user enabled the advisor mid-session with `/advisor on`.
+ */
+function refreshAdvisorState(
+	pi: ExtensionAPI,
+	state: SessionState,
+): { enabled: SettingHandle | undefined; sync: SettingHandle | undefined; roles: SettingHandle | undefined } {
+	const host = advisorSettings();
+	const enabled = host.enabled?.get(pi.pi.settings);
+	state.advisorEnabled = typeof enabled === "boolean" ? enabled : undefined;
+	const sync = host.sync?.get(pi.pi.settings);
+	state.syncPolicy = typeof sync === "string" ? sync : undefined;
+	return host;
+}
+
 /** Render the status line for the live config, and only touch the footer when it changed. */
 function updateStatus(
 	ctx: ExtensionContext,
@@ -365,6 +400,9 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 		const state = stateFor(sessionId);
 		state.episodeRound = 0;
 
+		// `--resume` rebuilds extension state; the arm decision lives in the branch.
+		const recordedArm = readArmState(ctx.sessionManager.getBranch());
+		if (recordedArm !== undefined) state.overrideEnabled = recordedArm;
 		const config = effectiveConfig(ctx.cwd, state);
 		const host = advisorSettings();
 
@@ -379,6 +417,8 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 		pi.logger.debug("advisor-consensus session_start", {
 			advisorEnabled: state.advisorEnabled,
 			syncBacklog: state.syncPolicy,
+			armed: config.enabled,
+			recordedArm,
 			config,
 		});
 
@@ -543,8 +583,14 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 		const config = effectiveConfig(ctx.cwd, state);
 
 		if (!config.enabled || state.paused) return;
+		const host = refreshAdvisorState(pi, state);
 		if (state.advisorEnabled === false) return;
 		if (ctx.sessionModes?.getState().plan.status === "active") return;
+		if (state.advisorEnabled === true && config.forceSyncBacklog && state.syncPolicy !== "strict") {
+			host.sync?.override(pi.pi.settings, "strict");
+			state.syncPolicy = "strict";
+			state.forcedSync = true;
+		}
 		syncAdvisorModel(pi, ctx, state, config);
 
 		const entries: SessionEntry[] = ctx.sessionManager.getBranch();
@@ -611,6 +657,7 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 			const enable = (): void => {
 				state.overrideEnabled = true;
 				state.paused = false;
+				pi.appendEntry(ARM_TYPE, { armed: true });
 				const config = effectiveConfig(ctx.cwd, state);
 				updateStatus(ctx, state, config, "armed");
 				ctx.ui.notify(
@@ -623,6 +670,7 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 				state.overrideEnabled = false;
 				state.paused = false;
 				state.episodeRound = 0;
+				pi.appendEntry(ARM_TYPE, { armed: false });
 				refresh();
 				const scan = scanEntries(ctx.sessionManager.getBranch());
 				const anchor = scan.lastUserEntryId ?? scan.ledger?.anchor ?? "session";

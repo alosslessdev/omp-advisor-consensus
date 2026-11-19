@@ -51,6 +51,10 @@ once per session when the advisor is off.
 /adversarial sync off     # release the advisor.syncBacklog pin
 ```
 
+Arming is recorded in the session transcript, so `/adversarial on` survives
+`omp --resume`. The plugin also re-reads `advisor.enabled` at every settle, so
+`/advisor on` mid-session is picked up without a restart.
+
 `/adversarial config` opens a TUI editor for the live values; the same numbers
 can be passed inline (`max`, `repeats`, `severity`) or set durably through
 plugin settings:
@@ -241,7 +245,7 @@ budget and a resumed session continues an interrupted episode.
 
 ```bash
 bun install
-bun test          # 31 tests: decision core + host wiring
+bun test          # 33 tests: decision core + host wiring
 bun run typecheck
 ```
 
