@@ -75,6 +75,9 @@ interface SessionState {
 	advisorEnabled: boolean | undefined;
 	syncPolicy: string | undefined;
 	forcedSync: boolean;
+	/** One attempt per session to switch the advisor on when the loop is armed. */
+	advisorForceAttempted: boolean;
+	forcedAdvisor: boolean;
 	overrideEnabled: boolean | undefined;
 	overrideMaxRounds: number | undefined;
 	overrideMaxRepeats: number | undefined;
@@ -116,6 +119,8 @@ function stateFor(sessionId: string): SessionState {
 			advisorEnabled: undefined,
 			syncPolicy: undefined,
 			forcedSync: false,
+			advisorForceAttempted: false,
+			forcedAdvisor: false,
 			overrideEnabled: undefined,
 			overrideMaxRounds: undefined,
 			overrideMaxRepeats: undefined,
@@ -361,6 +366,38 @@ function refreshAdvisorState(
 	return host;
 }
 
+/**
+ * Arming a loop with no reviewer is a no-op, so arming turns the advisor on for
+ * this session (runtime override, not persisted) when it is off. One attempt per
+ * session: if the user turns it back off with `/advisor off`, the plugin does
+ * not fight them.
+ */
+function ensureAdvisor(
+	pi: ExtensionAPI,
+	state: SessionState,
+	ctx: ExtensionContext,
+	config: ConsensusConfig,
+): void {
+	const host = advisorSettings();
+	const enabled = host.enabled?.get(pi.pi.settings);
+	state.advisorEnabled = typeof enabled === "boolean" ? enabled : undefined;
+	const wasOff = state.advisorEnabled === false;
+	if (!config.enabled || !wasOff || state.advisorForceAttempted) return;
+	state.advisorForceAttempted = true;
+	if (!host.enabled) return;
+	host.enabled.override(pi.pi.settings, true);
+	state.forcedAdvisor = true;
+	refreshAdvisorState(pi, state);
+	const nowEnabled = state.advisorEnabled === true;
+	pi.logger.debug("advisor-consensus forced advisor on", { advisorEnabled: nowEnabled });
+	if (nowEnabled) {
+		ctx.ui.notify(
+			"advisor-consensus: advisor was off; enabled it for this session so the loop has a reviewer.",
+			"info",
+		);
+	}
+}
+
 /** Render the status line for the live config, and only touch the footer when it changed. */
 function updateStatus(
 	ctx: ExtensionContext,
@@ -434,6 +471,7 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 			}
 			return;
 		}
+		ensureAdvisor(pi, state, ctx, config);
 		if (state.advisorEnabled === false) {
 			pi.logger.debug("advisor-consensus armed without advisor", { source: "session_start" });
 			if (!state.warnedMissingAdvisor) {
@@ -574,6 +612,7 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 		if (state?.refreshTimer) ctx.clearTimer(state.refreshTimer);
 		if (state?.forcedSync) advisorSettings().sync?.clearOverride(pi.pi.settings);
 		if (state?.pinnedAdvisorModel) advisorSettings().roles?.clearOverride(pi.pi.settings);
+		if (state?.forcedAdvisor) advisorSettings().enabled?.clearOverride(pi.pi.settings);
 		states.delete(ctx.sessionManager.getSessionId());
 	});
 
@@ -668,6 +707,7 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 				pi.appendEntry(ARM_TYPE, { armed: true });
 				refreshAdvisorState(pi, state);
 				const config = effectiveConfig(ctx.cwd, state);
+				ensureAdvisor(pi, state, ctx, config);
 				updateStatus(ctx, state, config, "armed");
 				ctx.ui.notify(
 					`advisor-consensus: adversarial loop on · ${config.maxRounds} rounds · repeats ${config.maxRepeats}`,
@@ -686,6 +726,11 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 				state.paused = false;
 				state.episodeRound = 0;
 				pi.appendEntry(ARM_TYPE, { armed: false });
+				if (state.forcedAdvisor) {
+					advisorSettings().enabled?.clearOverride(pi.pi.settings);
+					state.forcedAdvisor = false;
+					state.advisorEnabled = undefined;
+				}
 				refresh();
 				const scan = scanEntries(ctx.sessionManager.getBranch());
 				const anchor = scan.lastUserEntryId ?? scan.ledger?.anchor ?? "session";
