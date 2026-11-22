@@ -76,6 +76,11 @@
 				"default": true,
 				"description": "Default the advisor's model to the session's live model instead of the advisor role's slow chain. An explicitly configured modelRoles.advisor or WATCHDOG model still wins."
 			},
+			"requireStopCall": {
+				"type": "boolean",
+				"default": false,
+				"description": "Strict agreement: only an explicit advise(note: \"[converged] ...\") closes the loop. With this on, advisor silence escalates instead of converging — pair it with WATCHDOG.md that tells the advisor to call stop."
+			},
 			"notify": {
 				"type": "boolean",
 				"default": true,

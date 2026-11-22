@@ -52,6 +52,8 @@ export interface ConsensusConfig {
 	forceSyncBacklog: boolean;
 	/** Default the advisor's model to the session's live model. */
 	useSessionModel: boolean;
+	/** Require an explicit `[converged]` call; silence alone is not agreement. */
+	requireStopCall: boolean;
 	/** Toast on each round / convergence / escalation. */
 	notify: boolean;
 }
@@ -64,6 +66,7 @@ export const DEFAULT_CONFIG: ConsensusConfig = {
 	maxRepeats: 3,
 	forceSyncBacklog: true,
 	useSessionModel: true,
+	requireStopCall: false,
 	notify: true,
 };
 
@@ -98,7 +101,7 @@ export interface LedgerEntryData extends LedgerState {
 }
 
 export type IgnoreReason = "no-findings" | "settled" | "error-turn";
-export type EscalateReason = "rounds-exhausted" | "repeated" | "agent-open";
+export type EscalateReason = "rounds-exhausted" | "repeated" | "agent-open" | "advisor-silent";
 
 export type StopDecision =
 	| { kind: "ignore"; reason: IgnoreReason; round: number }
@@ -377,6 +380,16 @@ export function decideAtStop(input: StopInput): StopDecision {
 			};
 		}
 		if (!active) return { kind: "ignore", reason: "no-findings", round };
+		if (config.requireStopCall) {
+			// Strict agreement: only the advisor itself may close the episode.
+			return {
+				kind: "escalate",
+				reason: "advisor-silent",
+				findings: [],
+				round,
+				ledger: { anchor, round, seen: active.seen, settled: "escalated" },
+			};
+		}
 		const converged: LedgerState = { anchor, round, seen: active.seen, settled: "converged" };
 		if (parseVerdict(lastAssistant?.text ?? "") === "open") {
 			// The advisor is silent but the agent says work remains: no agreement.
@@ -472,6 +485,7 @@ const ESCALATION_REASON: Record<EscalateReason, (round: number) => string> = {
 	"rounds-exhausted": round => `round budget exhausted after ${round} round(s)`,
 	repeated: round => `the advisor re-raised the same finding after ${round} round(s)`,
 	"agent-open": () => "the agent reports open items while the advisor raised none",
+	"advisor-silent": () => "the advisor stayed silent instead of calling [converged]",
 };
 
 /** Human-facing escalation notice; the advisor cards themselves hold the detail. */
@@ -481,6 +495,9 @@ export function buildEscalationNotice(
 	round: number,
 ): string {
 	const header = `advisor-consensus: ${ESCALATION_REASON[reason](round)}.`;
+	if (reason === "advisor-silent") {
+		return `${header} Add the stop-call guidance to WATCHDOG.md, or allow silence with /adversarial require-stop off.`;
+	}
 	if (findings.length === 0) return `${header} Stopping here for you to decide.`;
 	const list = findings
 		.map((finding, index) => `${index + 1}. [${finding.severity}] ${finding.text.trim()}`)
@@ -523,6 +540,7 @@ export function resolveConfig(
 		OMP_ADVISOR_CONSENSUS_MAX_REPEATS: "maxRepeats",
 		OMP_ADVISOR_CONSENSUS_FORCE_SYNC_BACKLOG: "forceSyncBacklog",
 		OMP_ADVISOR_CONSENSUS_USE_SESSION_MODEL: "useSessionModel",
+		OMP_ADVISOR_CONSENSUS_REQUIRE_STOP_CALL: "requireStopCall",
 		OMP_ADVISOR_CONSENSUS_NOTIFY: "notify",
 	};
 	for (const [envKey, settingKey] of Object.entries(envMap)) {
@@ -550,6 +568,7 @@ export function resolveConfig(
 		maxRepeats: asInteger(merged.maxRepeats, 1, 10) ?? DEFAULT_CONFIG.maxRepeats,
 		forceSyncBacklog: booleanish(merged.forceSyncBacklog) ?? DEFAULT_CONFIG.forceSyncBacklog,
 		useSessionModel: booleanish(merged.useSessionModel) ?? DEFAULT_CONFIG.useSessionModel,
+		requireStopCall: booleanish(merged.requireStopCall) ?? DEFAULT_CONFIG.requireStopCall,
 		notify: booleanish(merged.notify) ?? DEFAULT_CONFIG.notify,
 	};
 }

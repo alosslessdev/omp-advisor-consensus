@@ -82,6 +82,7 @@ interface SessionState {
 	overrideMaxRounds: number | undefined;
 	overrideMaxRepeats: number | undefined;
 	overrideNotify: boolean | undefined;
+	overrideRequireStopCall: boolean | undefined;
 	refreshTimer: ReturnType<ExtensionContext["setInterval"]> | undefined;
 	overrideMinSeverity: Severity | undefined;
 	/** Paused: keep the episode and its round budget, just stop acting. */
@@ -125,6 +126,7 @@ function stateFor(sessionId: string): SessionState {
 			overrideMaxRounds: undefined,
 			overrideMaxRepeats: undefined,
 			overrideNotify: undefined,
+			overrideRequireStopCall: undefined,
 			refreshTimer: undefined,
 			overrideMinSeverity: undefined,
 			paused: false,
@@ -242,6 +244,7 @@ function effectiveConfig(cwd: string, state: SessionState): ConsensusConfig {
 		maxRepeats: state.overrideMaxRepeats ?? base.maxRepeats,
 		minSeverity: state.overrideMinSeverity ?? base.minSeverity,
 		notify: state.overrideNotify ?? base.notify,
+		requireStopCall: state.overrideRequireStopCall ?? base.requireStopCall,
 	};
 }
 
@@ -419,7 +422,7 @@ function describe(state: SessionState, config: ConsensusConfig): string {
 	const lines = [
 		`mode: ${mode}`,
 		`advisor: ${advisor}`,
-		`config: enabled=${config.enabled} severity>=${config.minSeverity} rounds=${config.maxRounds} repeats=${config.maxRepeats} notify=${config.notify}`,
+		`config: enabled=${config.enabled} severity>=${config.minSeverity} rounds=${config.maxRounds} repeats=${config.maxRepeats} stop-call=${config.requireStopCall ? "required" : "optional"} notify=${config.notify}`,
 		`syncBacklog: ${state.syncPolicy ?? "unknown"}${state.forcedSync ? " (pinned by this plugin)" : ""}`,
 		`advisor model: ${state.pinnedAdvisorModel ?? (state.advisorRoleConfigured ? "configured role" : "session default")}`,
 		`episode: round ${state.episodeRound}/${config.maxRounds}`,
@@ -959,6 +962,22 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 				case "severity":
 					setSeverity(value);
 					return;
+				case "require-stop": {
+					const mode = value.toLowerCase();
+					if (mode !== "on" && mode !== "off") {
+						ctx.ui.notify("advisor-consensus: /adversarial require-stop on|off", "warning");
+						return;
+					}
+					state.overrideRequireStopCall = mode === "on";
+					refresh();
+					ctx.ui.notify(
+						mode === "on"
+							? "advisor-consensus: only an explicit [converged] call closes the loop; silence escalates."
+							: "advisor-consensus: advisor silence also closes the loop.",
+						"info",
+					);
+					return;
+				}
 				case "model":
 					if (value === "session" || value === "configured") {
 						applyModel(value);
@@ -971,7 +990,7 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 					return;
 				default:
 					ctx.ui.notify(
-						"advisor-consensus: /adversarial [status|on|off|pause|resume|config|max N|repeats N|severity S|model session|model configured|sync on|off]",
+						"advisor-consensus: /adversarial [status|on|off|pause|resume|config|max N|repeats N|severity S|require-stop on|off|model session|model configured|sync on|off]",
 						"info",
 					);
 			}

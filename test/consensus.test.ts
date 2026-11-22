@@ -209,6 +209,36 @@ describe("settle decisions", () => {
 		expect(buildConvergedNotice(decision.round, decision.viaStopCall)).toContain("advisor called stop");
 	});
 
+	it("escalates on advisor silence only when the stop call is required", () => {
+		const branch = entries(
+			user("u1"),
+			ledger("l1", { v: 1, anchor: "u1", round: 2, seen: {} }),
+			noteWithDetails("n1", [{ note: "fixed it" }]),
+			assistant("a2", "done"),
+		);
+		expect(
+			decideAtStop({ entries: branch, config: config({ requireStopCall: true }), lastAssistant: { text: "done" } }),
+		).toMatchObject({ kind: "escalate", reason: "advisor-silent" });
+		expect(
+			decideAtStop({ entries: branch, config: config({ requireStopCall: false }), lastAssistant: { text: "done" } }),
+		).toMatchObject({ kind: "converged" });
+	});
+
+	it("lets the advisor's stop call close the loop even when a stop call is required", () => {
+		const branch = entries(
+			user("u1"),
+			ledger("l1", { v: 1, anchor: "u1", round: 2, seen: {} }),
+			assistant("a1", "done"),
+			noteWithDetails("n1", [{ note: "[converged] nothing left to raise" }]),
+		);
+		const decision = decideAtStop({
+			entries: branch,
+			config: config({ requireStopCall: true }),
+			lastAssistant: { text: "done" },
+		});
+		expect(decision).toMatchObject({ kind: "converged", viaStopCall: true });
+	});
+
 	it("ignores a stop call that arrives alongside an open finding", () => {
 		const branch = entries(
 			user("u1"),
