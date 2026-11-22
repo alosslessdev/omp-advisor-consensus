@@ -165,7 +165,7 @@ describe("settle decisions", () => {
 		);
 		const decision = decideAtStop({
 			entries: branch,
-			config: config(),
+			config: config({ requireStopCall: false }),
 			lastAssistant: { text: "added the test" },
 		});
 		expect(decision.kind).toBe("converged");
@@ -182,7 +182,7 @@ describe("settle decisions", () => {
 		);
 		const decision = decideAtStop({
 			entries: branch,
-			config: config(),
+			config: config({ requireStopCall: false }),
 			lastAssistant: { text: "<convergence>\nverdict: open\n</convergence>" },
 		});
 		expect(decision.kind).toBe("escalate");
@@ -207,6 +207,18 @@ describe("settle decisions", () => {
 		if (decision.kind !== "converged") return;
 		expect(decision.viaStopCall).toBe(true);
 		expect(buildConvergedNotice(decision.round, decision.viaStopCall)).toContain("advisor called stop");
+	});
+
+	it("requires the advisor's stop call by default", () => {
+		const branch = entries(
+			user("u1"),
+			ledger("l1", { v: 1, anchor: "u1", round: 2, seen: {} }),
+			assistant("a2", "done"),
+		);
+		expect(decideAtStop({ entries: branch, config: config(), lastAssistant: { text: "done" } })).toMatchObject({
+			kind: "escalate",
+			reason: "advisor-silent",
+		});
 	});
 
 	it("escalates on advisor silence only when the stop call is required", () => {

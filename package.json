@@ -78,8 +78,8 @@
 			},
 			"requireStopCall": {
 				"type": "boolean",
-				"default": false,
-				"description": "Strict agreement: only an explicit advise(note: \"[converged] ...\") closes the loop. With this on, advisor silence escalates instead of converging — pair it with WATCHDOG.md that tells the advisor to call stop."
+				"default": true,
+				"description": "Strict agreement: only an explicit advise(note: \"[converged] ...\") closes the loop; advisor silence escalates. Pair it with the WATCHDOG.md guidance in examples/ so the advisor knows the protocol."
 			},
 			"notify": {
 				"type": "boolean",

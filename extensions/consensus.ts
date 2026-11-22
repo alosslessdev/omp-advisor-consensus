@@ -713,7 +713,9 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 				ensureAdvisor(pi, state, ctx, config);
 				updateStatus(ctx, state, config, "armed");
 				ctx.ui.notify(
-					`advisor-consensus: adversarial loop on · ${config.maxRounds} rounds · repeats ${config.maxRepeats}`,
+					`advisor-consensus: adversarial loop on · ${config.maxRounds} rounds · repeats ${config.maxRepeats} · ${
+						config.requireStopCall ? "advisor must call [converged]" : "silence also closes"
+					}`,
 					"info",
 				);
 				if (state.advisorEnabled === false) {

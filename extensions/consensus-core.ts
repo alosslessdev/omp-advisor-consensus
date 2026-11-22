@@ -66,7 +66,7 @@ export const DEFAULT_CONFIG: ConsensusConfig = {
 	maxRepeats: 3,
 	forceSyncBacklog: true,
 	useSessionModel: true,
-	requireStopCall: false,
+	requireStopCall: true,
 	notify: true,
 };
 

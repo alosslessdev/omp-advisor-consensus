@@ -46,7 +46,7 @@ once per session when the advisor is off.
 /adversarial max 12       # rounds for this session (1..100)
 /adversarial repeats 4    # re-raises of one finding before escalation (1..10)
 /adversarial severity concern
-/adversarial require-stop on  # only an explicit [converged] call closes the loop
+/adversarial require-stop off # allow silence to close (default: required)
 /adversarial model session     # default: advisor runs the session's live model
 /adversarial model configured  # use modelRoles.advisor / the WATCHDOG entry model
 /adversarial sync off     # release the advisor.syncBacklog pin
@@ -122,11 +122,16 @@ decides whether to spend another turn. The call itself is not forwarded to the
 agent as work — it is recorded in the ledger as `viaStopCall` and stays visible
 in the transcript as an advisor card.
 
-Silence is the fallback signal, because the default reviewer prompt asks the
-advisor to speak only with evidence and the host's emission guard drops
-content-free notes (`stop`, `done`, `lgtm`). If you want the decision to be
-strictly the advisor's, turn `requireStopCall` on: an episode that ends without
-a call escalates with the open list instead of being called converged.
+That is the default (`requireStopCall: true`): an episode that ends without an
+explicit call escalates with the open list instead of being recorded as
+agreement. Because the default reviewer prompt asks the advisor to speak only
+with evidence, and the host's emission guard drops content-free notes (`stop`,
+`done`, `lgtm`), the loop needs the stop-call guidance to know the protocol —
+copy [`examples/WATCHDOG.md`](examples/WATCHDOG.md) into your `WATCHDOG.md`.
+
+`/adversarial require-stop off` (or `requireStopCall=false`) brings back
+silence-as-agreement: cheaper for a reviewer that only speaks when it has
+something to say, at the cost of an implicit decision.
 
 ### The advisor's stop call
 
@@ -195,7 +200,7 @@ rebuttal needs evidence the advisor has not already rejected.
 | `maxRepeats` | `3` | Re-raises of the same finding before escalation (1..10). |
 | `forceSyncBacklog` | `true` | Pin `advisor.syncBacklog: strict` while armed. |
 | `useSessionModel` | `true` | Default the advisor to the session's live model. |
-| `requireStopCall` | `false` | Strict agreement: only the advisor's `[converged]` call closes; silence escalates. |
+| `requireStopCall` | `true` | Strict agreement: only the advisor's `[converged]` call closes; silence escalates. |
 | `notify` | `true` | Toast per round, convergence, and escalation. |
 
 Env overrides for one process: `OMP_ADVISOR_CONSENSUS_ENABLED`,

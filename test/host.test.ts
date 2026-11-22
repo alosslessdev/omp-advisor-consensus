@@ -240,6 +240,7 @@ describe("host wiring", () => {
 		advisorConsensus(host.api);
 		await host.emit("session_start", {});
 		await host.commands.get("adversarial")!.handler("on", host.ctx);
+		await host.commands.get("adversarial")!.handler("require-stop off", host.ctx);
 
 		const result = await host.emit("session_stop", {
 			messages: [assistant("a2", "added the test")],
@@ -255,6 +256,25 @@ describe("host wiring", () => {
 		});
 		expect(host.statuses.at(-1)).toEqual(["advisor-consensus", "adversarial converged · 1/100"]);
 		expect(host.notifications.at(-1)?.message).toContain("converged after 1 round(s)");
+	});
+
+	it("escalates instead of converging when a strict episode ends on silence", async () => {
+		const branch = [
+			user("u1"),
+			ledger("l1", { v: 1, anchor: "u1", round: 1, seen: {} }),
+			advisorNote("n1", "fixed"),
+			assistant("a2", "done"),
+		];
+		const host = createHost(branch);
+		advisorConsensus(host.api);
+		await host.emit("session_start", {});
+		await host.commands.get("adversarial")!.handler("on", host.ctx);
+
+		const result = await host.emit("session_stop", stopEvent);
+
+		expect(result).toBeUndefined();
+		expect(host.notifications.at(-1)?.message).toContain("stayed silent instead of calling [converged]");
+		expect(host.appended.at(-1)).toMatchObject({ data: { settled: "escalated" } });
 	});
 
 	it("stops acting while paused and picks the same round back up on resume", async () => {
