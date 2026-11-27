@@ -5,16 +5,16 @@
 		"url": "https://github.com/alosslessdev"
 	},
 	"metadata": {
-		"description": "Adversarial goal loop for omp: an independent reviewer plus optional advisor notes re-prompt the agent until the goal is met",
-		"version": "0.3.1"
+		"description": "Advisor-driven adversarial loop with an independent reviewer gate and narrow operator-only-input escalation",
+		"version": "0.4.0"
 	},
 	"plugins": [
 		{
 			"name": "advisor-consensus",
 			"source": "./",
-			"description": "Unanswered advisor notes re-prompt the main session; when the advisor is silent an independent reviewer re-prompts if the goal is unmet. /adversarial on turns the advisor on. No escalation path.",
+			"description": "Unanswered advisor notes re-prompt the main session; when the advisor is silent an independent reviewer re-prompts if the goal is unmet. Escalates only for operator-only input: a physical action, a device that is off or missing, a photo, or an unusable capture.",
 			"category": "productivity",
-			"version": "0.3.1",
+			"version": "0.4.0",
 			"author": {
 				"name": "alosslessdev"
 			},

@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent";
 import {
 	buildConvergedNotice,
+	buildEscalationBlockedNotice,
 	buildRemediationPrompt,
 	buildReviewerPrompt,
 	decideAtStop,
@@ -105,6 +106,25 @@ describe("reviewer reply parsing", () => {
 		expect(fenced.ok && fenced.result.goalMet).toBe(true);
 		const bare = parseReview('Verdict: {"goal_met": false, "findings": []} — done.');
 		expect(bare.ok && bare.result.goalMet).toBe(false);
+	});
+
+	it("parses a blocked verdict for operator-only input and drops unsafe forms", () => {
+		const blocked = parseReview(
+			'<review>{"goal_met": false, "findings": [], "blocked": {"kind": "device", "needs": "turn on the camera", "tried": "lsusb shows no capture device"}}</review>',
+		);
+		expect(blocked.ok && blocked.result.blocked).toEqual({
+			kind: "device",
+			needs: "turn on the camera",
+			tried: "lsusb shows no capture device",
+		});
+
+		// Unknown kinds, missing needs, and a "blocked" alongside a met goal are ignored.
+		const unknown = parseReview('<review>{"goal_met": false, "blocked": {"kind": "vibes", "needs": "x"}}</review>');
+		expect(unknown.ok && unknown.result.blocked).toBeUndefined();
+		const noNeeds = parseReview('<review>{"goal_met": false, "blocked": {"kind": "photo"}}</review>');
+		expect(noNeeds.ok && noNeeds.result.blocked).toBeUndefined();
+		const met = parseReview('<review>{"goal_met": true, "blocked": {"kind": "photo", "needs": "x"}}</review>');
+		expect(met.ok && met.result.blocked).toBeUndefined();
 	});
 
 	it("rejects an unusable reply instead of guessing", () => {
@@ -243,6 +263,34 @@ describe("decision at the settle boundary", () => {
 		expect(decision).toMatchObject({ kind: "continue", round: 3, budgetSpent: true });
 	});
 
+	it("escalates only on a blocked verdict and closes the episode", () => {
+		const branch = entries(user("u1"), assistant("a1", "done"));
+		const decision = decideAtStop({
+			entries: branch,
+			config: config(),
+			lastAssistant: { text: "done" },
+			review: review({
+				goalMet: false,
+				findings: [{ text: "needs the panel photo", severity: "blocker" }],
+				blocked: { kind: "photo", needs: "photo of the panel after boot", tried: "no camera reachable" },
+			}),
+		});
+		expect(decision).toMatchObject({
+			kind: "escalate",
+			blocked: { kind: "photo", needs: "photo of the panel after boot" },
+			round: 0,
+			ledger: {
+				anchor: "u1",
+				settled: "escalated",
+				blocked: { kind: "photo", needs: "photo of the panel after boot" },
+			},
+		});
+		if (decision.kind !== "escalate") return;
+		expect(buildEscalationBlockedNotice(decision.blocked, decision.findings)).toContain(
+			"needs a photo only the user can take: photo of the panel after boot",
+		);
+	});
+
 	it("reads a legacy v1 escalated ledger as a closed episode", () => {
 		const branch = entries(
 			user("u1"),
@@ -250,7 +298,7 @@ describe("decision at the settle boundary", () => {
 			assistant("a1", "done"),
 		);
 		const scan = scanEntries(branch);
-		expect(scan.ledger).toMatchObject({ v: 2, round: 4, settled: "cancelled" });
+		expect(scan.ledger).toMatchObject({ v: 2, round: 4, settled: "escalated" });
 		expect(decideAtStop({ entries: branch, config: config(), lastAssistant: { text: "done" }, review: review() })).toMatchObject({
 			kind: "ignore",
 			reason: "settled",
@@ -402,6 +450,8 @@ describe("prompts and notices", () => {
 		expect(prompt).toContain("<goal>\nadd a regression test\n</goal>");
 		expect(prompt).toContain("goal_met");
 		expect(prompt).toContain("<review>");
+		expect(prompt).toContain("turn on, plug in, or point a device");
+		expect(prompt).toContain("retake an unusable capture");
 		expect(buildReviewerPrompt(undefined, { strict: true })).toContain("could not be parsed");
 	});
 
@@ -410,6 +460,7 @@ describe("prompts and notices", () => {
 		expect(prompt).toContain('<adversarial-review round="2" max_rounds="10">');
 		expect(prompt).toContain("1. [concern] missing test");
 		expect(prompt).toContain("1: fixed | rebutted | blocked");
+		expect(prompt).toContain("blocked: <kind>: <exact input needed>");
 		expect(prompt).not.toContain("verdict:");
 		expect(prompt.toLowerCase()).not.toContain("escalat");
 	});

@@ -11,9 +11,12 @@ Arming the loop (`/adversarial on`) turns the advisor on for the session, so the
 default is the original advisor-driven loop with the reviewer as the final word.
 With the advisor off or excluded, the reviewer alone gates the goal.
 
-There is **no escalation path**: an unmet goal never gets handed back to the
-operator as a failure state. The episode ends only when both sources agree, or
-when you pause/stop the loop.
+There is **no escalation for unmet, actionable work**: budget exhaustion and
+repeated findings raise pressure and keep looping. The one escalation is a
+**blocked goal that needs operator-only input** — a physical action (turn on or
+plug in a camera), a photo, a file outside the session's reach, or a usable
+recapture when the supplied capture is blurry. Then the loop stops and tells you
+exactly what to provide.
 
 Think Ralph loop (`while not done: run again`) with a second pass of the same
 model as the termination oracle, a per-prompt ledger, stall pressure, and an
@@ -69,6 +72,7 @@ adversarial on · 100 rounds (soft) · repeats 3
 adversarial 4/100 · 2 open
 adversarial 4/100 · 2 open · stall 1
 adversarial converged · 4/100
+adversarial escalated · needs photo
 adversarial paused · 4/100
 ```
 
@@ -101,10 +105,12 @@ agent turn ---> unanswered advisor notes?
     |                    |
     |             goal met?
     |                    |
-    |             yes ---+--- no
-    |             |           |
-    |             v           v
-    |          settle    continuation turn with the findings
+    |        +-----------+-----------+
+    |        |           |           |
+    |       yes          no        blocked (operator-only input)
+    |        |           |           |
+    |        v           v           v
+    |      settle   continuation   escalate: stop + say what to provide
     |                        |
     +------------------------+   (round++, budget is soft)
 ```
@@ -121,7 +127,8 @@ with one machine-readable block:
 ```xml
 <review>
 {"goal_met": false, "goal": "…", "summary": "…",
- "findings": [{"severity": "blocker", "text": "…"}]}
+ "findings": [{"severity": "blocker", "text": "…"}],
+ "blocked": {"kind": "device", "needs": "turn on the camera", "tried": "…"}}
 </review>
 ```
 
@@ -129,10 +136,28 @@ A reply that does not parse is retried once with a strict prompt; if it still
 fails, the loop settles *without* continuing and warns. It never treats a broken
 review as agreement.
 
-### Why there is no escalation
+### When escalation happens
 
-Escalating an unmet goal to the operator means "the goal was not met" — the loop
-quitting on its own. This plugin does not do that:
+Escalation is reserved for work the session **cannot** do with software. The
+reviewer may emit a `blocked` object only when the remaining step needs the
+operator:
+
+| Kind | Example |
+| --- | --- |
+| `physical` | turn the device on, plug the cable in, press the button |
+| `device` | the required camera/hardware is not connected, powered, or reachable |
+| `capture` | the supplied photo is blurry, occluded, or wrong; it must be retaken |
+| `photo` | a photo only the user can take |
+| `file` | a file outside the session's reach |
+| `credential` | credentials the session does not have |
+| `external` | other external input |
+
+On a blocked verdict the episode is written as `settled: "escalated"` with the
+`blocked` object, the status line shows `adversarial escalated · needs <kind>`,
+and the toast names the exact input plus what was already tried. The loop stops
+until you provide it and send a new message (a new prompt starts a fresh episode).
+
+Everything else keeps looping:
 
 - **`maxRounds` is a soft budget.** Crossing it produces another round with a
   visible budget notice, not a hand-off. The round counter runs past the budget.
@@ -140,8 +165,9 @@ quitting on its own. This plugin does not do that:
   `maxRepeats` times switches the next continuation into stall mode: the agent is
   told the previous approach failed, that repetition is failure, and to change
   the concrete action or name the exact missing input.
-- **Only the reviewer closes an episode.** The agent cannot self-certify, and the
-  operator's only exits are explicit: pause, off, or interrupting the turn.
+- **The agent cannot escalate itself.** It may report `blocked: <kind>: <need>`,
+  but the reviewer verifies the claim; an actionable gap becomes a finding and
+  keeps the loop going.
 
 Interrupted (`aborted`) and provider-errored turns are never reviewed, so
 Ctrl-C stops the loop for that turn instead of starting another.
@@ -264,8 +290,8 @@ Each round appends a `custom` session entry:
 `anchor` scopes the episode to one user prompt, so a new prompt starts a fresh
 budget and a resumed session continues an interrupted episode. Advisor findings
 are not duplicated into the ledger; they are re-read from the transcript each
-round. Ledger `v: 1` entries are still read; a legacy `settled: "escalated"` is
-treated as a closed episode, never reopened.
+round. Ledger `v: 1` entries are still read; a `settled: "escalated"` episode is
+closed until a new user message starts a fresh anchor.
 
 ## Development
 

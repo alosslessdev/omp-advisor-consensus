@@ -1,7 +1,7 @@
 {
 	"name": "omp-advisor-consensus",
-	"version": "0.3.1",
-	"description": "Self-contained adversarial goal loop with an independent reviewer, optionally supplemented by omp advisor notes, that re-prompts until the goal is met",
+	"version": "0.4.0",
+	"description": "Advisor-driven adversarial loop with an independent reviewer gate, escalating only when a goal is blocked on operator-only physical input",
 	"type": "module",
 	"license": "MIT",
 	"repository": {
@@ -30,7 +30,7 @@
 		".omp-plugin/"
 	],
 	"omp": {
-		"description": "Advisor-driven adversarial loop: unanswered advisor notes re-prompt the main session, and an independent reviewer gates the goal when the advisor is silent. Arming turns the advisor on. No escalation.",
+		"description": "Unanswered advisor findings re-prompt the main session; an independent reviewer gates the goal when the advisor is silent. Escalates only when the goal is blocked on input only the user can provide (photo, device, physical action, unusable capture).",
 		"extensions": [
 			"./extensions/consensus.ts"
 		],

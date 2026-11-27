@@ -25,6 +25,7 @@ import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import {
 	buildBudgetNotice,
 	buildConvergedNotice,
+	buildEscalationBlockedNotice,
 	buildRemediationPrompt,
 	buildReviewerFailedNotice,
 	buildReviewerPrompt,
@@ -50,8 +51,10 @@ import {
 	SEVERITIES,
 	type ConsensusConfig,
 	type ContinueDecision,
+	type EscalateDecision,
 	type LedgerEntryData,
 	type LedgerState,
+	type ReviewBlocker,
 	type ReviewResult,
 	type Severity,
 	normalizeSeverity,
@@ -98,7 +101,9 @@ interface SessionState {
 	stalls: number;
 	/** One budget toast per episode. */
 	budgetWarned: boolean;
-	phase: "armed" | "round" | "paused" | "converged";
+	phase: "armed" | "round" | "paused" | "converged" | "escalated";
+	/** Set when the loop stopped for operator-supplied input. */
+	blocked: ReviewBlocker | undefined;
 	lastStatusText: string | undefined;
 	warnedDisabled: boolean;
 	warnedUnavailable: boolean;
@@ -148,6 +153,7 @@ function stateFor(sessionId: string): SessionState {
 			stalls: 0,
 			budgetWarned: false,
 			phase: "armed",
+			blocked: undefined,
 			lastStatusText: undefined,
 			warnedDisabled: false,
 			warnedUnavailable: false,
@@ -410,6 +416,8 @@ function statusLine(state: SessionState, config: ConsensusConfig, phase: Session
 			return `adversarial ${state.episodeRound}/${config.maxRounds} · ${state.lastOpenCount} open${stall}`;
 		case "converged":
 			return `adversarial converged · ${state.episodeRound}/${config.maxRounds}`;
+		case "escalated":
+			return `adversarial escalated · needs ${state.blocked?.kind ?? "input"}`;
 		default:
 			return `adversarial on · ${config.maxRounds} rounds (soft) · repeats ${config.maxRepeats}`;
 	}
@@ -439,6 +447,7 @@ function describe(state: SessionState, config: ConsensusConfig, reviewerAvailabl
 		`advisor: ${config.includeAdvisor ? advisor : "excluded"}${state.syncPolicy ? ` · syncBacklog ${state.syncPolicy}${state.forcedSync ? " (pinned)" : ""}` : ""}`,
 		`config: enabled=${config.enabled} severity>=${config.minSeverity} rounds=${config.maxRounds} (soft) repeats=${config.maxRepeats} notify=${config.notify}`,
 		`episode: round ${state.episodeRound}/${config.maxRounds}${state.stalls > 0 ? ` · stall ${state.stalls}` : ""}`,
+		...(state.blocked ? [`blocked: ${state.blocked.kind} — ${state.blocked.needs}`] : []),
 		`converged this session: ${state.convergedCount}`,
 	];
 	return lines.join("\n");
@@ -557,6 +566,20 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 		}
 	};
 
+	const settleEscalated = (
+		ctx: ExtensionContext,
+		state: SessionState,
+		config: ConsensusConfig,
+		decision: EscalateDecision,
+	): void => {
+		pi.appendEntry(LEDGER_TYPE, { ...decision.ledger, v: 2 } satisfies LedgerEntryData);
+		state.episodeRound = decision.round;
+		state.lastOpenCount = decision.findings.length;
+		state.blocked = decision.blocked;
+		updateStatus(ctx, state, config, "escalated");
+		ctx.ui.notify(buildEscalationBlockedNotice(decision.blocked, decision.findings), "warning");
+	};
+
 	const settleConverged = (
 		ctx: ExtensionContext,
 		state: SessionState,
@@ -566,6 +589,7 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 		pi.appendEntry(LEDGER_TYPE, { ...decision.ledger, v: 2 } satisfies LedgerEntryData);
 		state.episodeRound = decision.round;
 		state.lastOpenCount = 0;
+		state.blocked = undefined;
 		state.convergedCount++;
 		updateStatus(ctx, state, config, "converged");
 		if (config.notify) ctx.ui.notify(buildConvergedNotice(decision.round), "info");
@@ -590,6 +614,9 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 				return;
 			case "converged":
 				settleConverged(ctx, state, config, decision);
+				return;
+			case "escalate":
+				settleEscalated(ctx, state, config, decision);
 				return;
 			case "continue":
 				recordRound(ctx, state, config, decision);
@@ -709,6 +736,7 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 			state.stopHookRounds = 0;
 			state.stalls = 0;
 			state.budgetWarned = false;
+			state.blocked = undefined;
 		}
 		state.stopHookAnchor = anchor;
 	});
@@ -795,6 +823,9 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 			case "converged":
 				settleConverged(ctx, state, config, decision);
 				return;
+			case "escalate":
+				settleEscalated(ctx, state, config, decision);
+				return;
 			case "continue": {
 				recordRound(ctx, state, config, decision);
 				const prompt = buildRemediationPrompt(decision.findings, decision.round, config.maxRounds, {
@@ -860,6 +891,7 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 				state.episodeRound = 0;
 				state.pendingRound = undefined;
 				state.stalls = 0;
+				state.blocked = undefined;
 				pi.appendEntry(ARM_TYPE, { armed: false });
 				releaseAdvisorOverrides(state);
 				state.advisorEnabled = undefined;

@@ -23,6 +23,31 @@ const SEVERITY_RANK: Readonly<Record<Severity, number>> = {
 
 export const SEVERITIES: readonly Severity[] = ["nit", "concern", "blocker"];
 
+/**
+ * Inputs a session cannot obtain with software, and therefore may escalate to
+ * the operator. Anything checkable or fixable in-session is a finding instead.
+ */
+export const BLOCKED_KINDS = ["photo", "file", "device", "capture", "physical", "credential", "external"] as const;
+export type BlockedKind = (typeof BLOCKED_KINDS)[number];
+
+const BLOCKED_LABEL: Readonly<Record<BlockedKind, string>> = {
+	photo: "a photo only the user can take",
+	file: "a file the session cannot access",
+	device: "hardware that is not connected, powered on, or reachable",
+	capture: "a usable capture (the supplied one is blurry, occluded, or wrong)",
+	physical: "a physical action only the user can perform",
+	credential: "credentials the session does not have",
+	external: "external input the session cannot obtain",
+};
+
+export interface ReviewBlocker {
+	kind: BlockedKind;
+	/** Exact input the operator must supply. */
+	needs: string;
+	/** What the agent already tried, when the reviewer recorded it. */
+	tried?: string;
+}
+
 /** Custom message type the host uses for advisor notes (steered and preserved cards). */
 export const ADVISOR_CUSTOM_TYPE = "advisor";
 
@@ -100,6 +125,8 @@ export interface ReviewResult {
 	goal?: string;
 	/** One-line justification for the verdict. */
 	summary?: string;
+	/** Set only when the remaining work needs operator-supplied input. */
+	blocked?: ReviewBlocker;
 	findings: ReviewerFinding[];
 }
 
@@ -113,7 +140,9 @@ export interface LedgerState {
 	/** Stall pressure tiers reached in this episode. */
 	stalls?: number;
 	/** Set once the episode ended; no further rounds for this anchor. */
-	settled?: "converged" | "cancelled";
+	settled?: "converged" | "escalated" | "cancelled";
+	/** Why the episode was escalated to the operator. */
+	blocked?: ReviewBlocker;
 }
 
 export interface LedgerEntryData extends LedgerState {
@@ -133,9 +162,18 @@ export interface ContinueDecision {
 	budgetSpent: boolean;
 }
 
+export interface EscalateDecision {
+	kind: "escalate";
+	blocked: ReviewBlocker;
+	findings: ReviewerFinding[];
+	round: number;
+	ledger: LedgerState;
+}
+
 export type StopDecision =
 	| { kind: "ignore"; reason: IgnoreReason; round: number }
 	| { kind: "converged"; round: number; ledger: LedgerState; goal?: string }
+	| EscalateDecision
 	| ContinueDecision;
 
 export function normalizeSeverity(value: unknown): Severity {
@@ -329,9 +367,8 @@ interface EntryScan {
 
 function parseSettled(value: unknown): LedgerState["settled"] | undefined {
 	if (value === "converged") return "converged";
-	// `escalated` is a v1 state: the goal was unmet when the episode closed.
-	// Read it as closed so an upgrade cannot resurrect an old hand-off episode.
-	if (value === "cancelled" || value === "escalated") return "cancelled";
+	if (value === "escalated") return "escalated";
+	if (value === "cancelled") return "cancelled";
 	return undefined;
 }
 
@@ -348,6 +385,7 @@ function parseLedger(data: unknown): LedgerEntryData | undefined {
 	}
 	const stalls = "stalls" in data && typeof data.stalls === "number" && Number.isFinite(data.stalls) ? Math.max(0, Math.trunc(data.stalls)) : undefined;
 	const settled = parseSettled("settled" in data ? data.settled : undefined);
+	const blocked = "blocked" in data ? parseBlocker(data.blocked) : undefined;
 	return {
 		v: 2,
 		anchor: data.anchor,
@@ -355,6 +393,7 @@ function parseLedger(data: unknown): LedgerEntryData | undefined {
 		seen,
 		...(stalls ? { stalls } : {}),
 		...(settled ? { settled } : {}),
+		...(blocked ? { blocked } : {}),
 	};
 }
 
@@ -418,6 +457,17 @@ function reviewPayload(reply: string): string | undefined {
 	return balancedJson(reply);
 }
 
+function parseBlocker(value: unknown): ReviewBlocker | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const kindRaw = "kind" in value && typeof value.kind === "string" ? value.kind.trim().toLowerCase() : "";
+	const kind = (BLOCKED_KINDS as readonly string[]).includes(kindRaw) ? (kindRaw as BlockedKind) : undefined;
+	const needs = "needs" in value && typeof value.needs === "string" ? value.needs.trim() : "";
+	if (!kind || !needs) return undefined;
+	const tried =
+		"tried" in value && typeof value.tried === "string" && value.tried.trim() ? value.tried.trim() : undefined;
+	return { kind, needs, ...(tried ? { tried } : {}) };
+}
+
 export type ReviewParse = { ok: true; result: ReviewResult } | { ok: false; reason: string };
 
 /**
@@ -456,6 +506,7 @@ export function parseReview(reply: string): ReviewParse {
 	}
 	const goal = typeof record.goal === "string" && record.goal.trim() ? record.goal.trim() : undefined;
 	const summary = typeof record.summary === "string" && record.summary.trim() ? record.summary.trim() : undefined;
+	const blocked = verdict === false ? parseBlocker(record.blocked) : undefined;
 	return {
 		ok: true,
 		result: {
@@ -463,6 +514,7 @@ export function parseReview(reply: string): ReviewParse {
 			findings,
 			...(goal ? { goal } : {}),
 			...(summary ? { summary } : {}),
+			...(blocked ? { blocked } : {}),
 		},
 	};
 }
@@ -503,6 +555,27 @@ export function decideAtStop(input: {
 		? review.findings.filter(finding => meetsMinSeverity(finding.severity, config.minSeverity))
 		: [];
 	const findings = mergeFindings([...reviewerFindings, ...advisorFindings]);
+
+	// The one legitimate escalation: the remaining work needs input the session
+	// cannot obtain in software (a photo, an inaccessible file, a device that is
+	// off or missing, a physical action, a usable recapture). The reviewer must
+	// say so explicitly; unmet-but-actionable goals keep looping.
+	if (review?.blocked && !review.goalMet) {
+		return {
+			kind: "escalate",
+			blocked: review.blocked,
+			findings,
+			round,
+			ledger: {
+				anchor,
+				round,
+				seen: active?.seen ?? {},
+				...(active?.stalls ? { stalls: active.stalls } : {}),
+				settled: "escalated",
+				blocked: review.blocked,
+			},
+		};
+	}
 
 	if (findings.length === 0) {
 		if (!review) return { kind: "ignore", reason: "no-review", round };
@@ -572,11 +645,15 @@ export function buildReviewerPrompt(goal: string | undefined, options: ReviewerP
 		"4. Do not invent requirements the user did not ask for. Pure style preferences are `nit` at most.",
 		"5. If you list any finding, `goal_met` must be false. Otherwise `goal_met` must be true and `findings` empty.",
 		"6. Severity: `blocker` = the goal is impossible while this is open; `concern` = a real gap; `nit` = minor.",
+		"7. Escalation is reserved for missing operator input. Add `blocked` ONLY when the remaining work needs the user to act in the physical world or supply something outside the session's reach:",
+		"   turn on, plug in, or point a device; take a photo; provide an inaccessible file; retake an unusable capture (blurry, occluded, wrong angle); supply a credential. Kinds: photo, file, device, capture, physical, credential, external.",
+		"8. Never mark `blocked` for something checkable with tools or fixable in software, and never for a finding you are still raising. When `blocked` is set, `goal_met` must be false, `needs` must name the exact input, and `tried` should say what was attempted.",
 		"",
 		"Reply with exactly one <review> block and nothing outside it:",
 		"<review>",
-		'{"goal_met": false, "goal": "<one line>", "summary": "<one line>", "findings": [{"severity": "blocker", "text": "<one concrete unmet requirement>"}]}',
+		'{"goal_met": false, "goal": "<one line>", "summary": "<one line>", "findings": [{"severity": "blocker", "text": "<one concrete unmet requirement>"}], "blocked": {"kind": "device", "needs": "<exact input only the user can provide>", "tried": "<what was attempted>"}}',
 		"</review>",
+		"Omit `blocked` for every goal the agent can still close with its tools.",
 	];
 	if (options.strict) {
 		lines.push(
@@ -644,6 +721,13 @@ export function buildRemediationPrompt(
 			"</stall>",
 		);
 	}
+	lines.push(
+		"",
+		"If (and only if) the remaining work needs input only the user can supply — a photo, a file you cannot access,",
+		"a physical action such as turning on or plugging in a camera, or a usable recapture because the current photo is",
+		"blurry — end with `blocked: <kind>: <exact input needed>`. Kinds: photo, file, device, capture, physical,",
+		"credential, external. Never use it for anything you can check or fix yourself; the reviewer verifies the claim.",
+	);
 	if (round > maxRounds) {
 		lines.push(
 			"",
@@ -684,6 +768,21 @@ export function buildStallNotice(tier: number, findings: readonly ReviewerFindin
 }
 
 /** Human-facing notice when the reviewer reply cannot be used. */
+/** Operator-facing escalation: exactly which input the loop is waiting for. */
+export function buildEscalationBlockedNotice(
+	blocker: ReviewBlocker,
+	findings: readonly ReviewerFinding[],
+): string {
+	const tried = blocker.tried ? ` Tried: ${blocker.tried}.` : "";
+	const list =
+		findings.length > 0
+			? `\nStill open:\n${findings
+					.map((finding, index) => `${index + 1}. [${finding.severity}] ${finding.text.trim()}`)
+					.join("\n")}`
+			: "";
+	return `advisor-consensus: escalated — needs ${BLOCKED_LABEL[blocker.kind]}: ${blocker.needs}.${tried} The loop is stopped for you; provide it and send a new message to resume.${list}`;
+}
+
 export function buildReviewerFailedNotice(reason: string): string {
 	return `advisor-consensus: the reviewer reply was unusable (${reason}); no continuation this turn. /adversarial review retries it.`;
 }
@@ -696,7 +795,8 @@ export function buildReviewerUnavailableNotice(): string {
 /** Manual `/adversarial review` report. */
 export function describeReview(review: ReviewResult): string {
 	const verdict = review.goalMet && review.findings.length === 0 ? "met" : "NOT met";
-	const head = `reviewer: goal ${verdict}${review.goal ? ` — ${review.goal}` : ""}${review.summary ? `\n${review.summary}` : ""}`;
+	const blocked = review.blocked ? `\nblocked: ${review.blocked.kind} — ${review.blocked.needs}` : "";
+	const head = `reviewer: goal ${verdict}${review.goal ? ` — ${review.goal}` : ""}${review.summary ? `\n${review.summary}` : ""}${blocked}`;
 	if (review.findings.length === 0) return head;
 	return `${head}\n${review.findings
 		.map((finding, index) => `${index + 1}. [${finding.severity}] ${finding.text.trim()}`)

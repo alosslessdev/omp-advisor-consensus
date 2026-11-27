@@ -51,6 +51,14 @@ function unmetReply(text: string, severity = "concern"): string {
 	return `<review>${JSON.stringify({ goal_met: false, findings: [{ severity, text }] })}</review>`;
 }
 
+function blockedReply(needs: string, kind = "device"): string {
+	return `<review>${JSON.stringify({
+		goal_met: false,
+		findings: [{ severity: "blocker", text: needs }],
+		blocked: { kind, needs, tried: "no capture device reachable" },
+	})}</review>`;
+}
+
 /**
  * Minimal host double: records registrations and replays the events the
  * session emits. `runEphemeralTurn` is the plugin's reviewer, so the double
@@ -335,6 +343,49 @@ describe("host wiring", () => {
 		expect(host.appended.at(-1)).toMatchObject({ data: { round: 4, stalls: 2 } });
 		expect(host.statuses.at(-1)?.[1]).toBe("adversarial 4/100 · 1 open · stall 2");
 		expect(host.notifications.some(entry => entry.message.includes("stall pressure 2"))).toBe(true);
+	});
+
+	it("escalates instead of continuing when the goal needs a physical action", async () => {
+		const branch: unknown[] = [user("u1"), assistant("a1", "done")];
+		const host = createHost(branch);
+		advisorConsensus(host.api);
+		await host.emit("session_start", {});
+		await host.commands.get("adversarial")!.handler("on", host.ctx);
+		host.queueReview(blockedReply("take a photo of the panel status LEDs", "photo"));
+
+		const result = await host.emit("session_stop", stopEvent);
+
+		expect(result).toBeUndefined();
+		expect(host.sent).toHaveLength(0);
+		expect(host.appended.at(-1)).toMatchObject({
+			data: {
+				round: 0,
+				settled: "escalated",
+				blocked: { kind: "photo", needs: "take a photo of the panel status LEDs" },
+			},
+		});
+		expect(host.statuses.at(-1)?.[1]).toBe("adversarial escalated · needs photo");
+		expect(host.notifications.at(-1)?.level).toBe("warning");
+		expect(host.notifications.at(-1)?.message).toContain("needs a photo only the user can take");
+		expect(host.notifications.at(-1)?.message).toContain("provide it and send a new message to resume");
+
+		// The episode stays closed: another settle must not review or continue.
+		const appended = host.appended.filter(entry => entry.type === "advisor-consensus").at(-1);
+		branch.push(ledger("l1", appended!.data as Record<string, unknown>));
+		expect(await host.emit("session_stop", stopEvent)).toBeUndefined();
+		expect(host.reviewPrompts).toHaveLength(1);
+	});
+
+	it("escalates on a camera that is missing or unusable", async () => {
+		const host = createHost([user("u1"), assistant("a1", "done")]);
+		advisorConsensus(host.api);
+		await host.emit("session_start", {});
+		await host.commands.get("adversarial")!.handler("on", host.ctx);
+		host.queueReview(blockedReply("plug in and turn on the camera", "device"));
+
+		expect(await host.emit("session_stop", stopEvent)).toBeUndefined();
+		expect(host.notifications.at(-1)?.message).toContain("hardware that is not connected, powered on, or reachable");
+		expect(host.statuses.at(-1)?.[1]).toBe("adversarial escalated · needs device");
 	});
 
 	it("does not continue when the reviewer reply never parses", async () => {
