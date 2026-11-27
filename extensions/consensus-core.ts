@@ -240,6 +240,15 @@ export function pendingAdvisorFindings(
 	return findings;
 }
 
+/** Advisor findings that survive the severity floor for this config. */
+export function blockingAdvisorFindings(
+	entries: readonly SessionEntry[],
+	config: ConsensusConfig,
+): ReviewerFinding[] {
+	if (!config.includeAdvisor) return [];
+	return pendingAdvisorFindings(entries).filter(finding => meetsMinSeverity(finding.severity, config.minSeverity));
+}
+
 /** Union by normalized text; the higher severity and an advisor label survive. */
 function mergeFindings(findings: readonly ReviewerFinding[]): ReviewerFinding[] {
 	const byKey = new Map<string, ReviewerFinding>();
@@ -485,34 +494,35 @@ export function decideAtStop(input: {
 	if (active?.settled && !(input.allowReopen === true && active.settled === "converged")) {
 		return { kind: "ignore", reason: "settled", round };
 	}
-	if (!review) return { kind: "ignore", reason: "no-review", round };
-
-	const reviewerFindings = review.findings.filter(finding =>
-		meetsMinSeverity(finding.severity, config.minSeverity),
-	);
-	// The advisor is a second, independent source: its unanswered notes count as
-	// findings even when the reviewer would accept the goal. Findings filtered
-	// out by the severity floor are not loop-worthy, but a bare
-	// `goal_met: false` with no findings still keeps the loop.
-	const advisorFindings = config.includeAdvisor
-		? pendingAdvisorFindings(entries, scan).filter(finding => meetsMinSeverity(finding.severity, config.minSeverity))
+	// The advisor drives the loop exactly as it did before: its unanswered notes
+	// are findings, and a round is spent on them without consulting the reviewer
+	// (that is the "in the end" gate below). Findings filtered out by the
+	// severity floor are not loop-worthy.
+	const advisorFindings = blockingAdvisorFindings(entries, config);
+	const reviewerFindings = review
+		? review.findings.filter(finding => meetsMinSeverity(finding.severity, config.minSeverity))
 		: [];
 	const findings = mergeFindings([...reviewerFindings, ...advisorFindings]);
-	const goalMet = findings.length === 0 && (review.findings.length > 0 || review.goalMet);
 
-	if (goalMet) {
-		return {
-			kind: "converged",
-			round,
-			...(review.goal ? { goal: review.goal } : {}),
-			ledger: {
-				anchor,
+	if (findings.length === 0) {
+		if (!review) return { kind: "ignore", reason: "no-review", round };
+		// Either the reviewer accepted the goal, or every finding it raised was
+		// below the severity floor. A bare `goal_met: false` with no findings
+		// still keeps the loop alive, so it falls through.
+		if (review.goalMet || review.findings.length > 0) {
+			return {
+				kind: "converged",
 				round,
-				seen: active?.seen ?? {},
-				...(active?.stalls ? { stalls: active.stalls } : {}),
-				settled: "converged",
-			},
-		};
+				...(review.goal ? { goal: review.goal } : {}),
+				ledger: {
+					anchor,
+					round,
+					seen: active?.seen ?? {},
+					...(active?.stalls ? { stalls: active.stalls } : {}),
+					settled: "converged",
+				},
+			};
+		}
 	}
 
 	const seen = { ...(active?.seen ?? {}) };

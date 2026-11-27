@@ -456,18 +456,18 @@ describe("host wiring", () => {
 		expect(host.statuses.at(-1)?.[1]).toBe("adversarial 7/100 · 1 open");
 	});
 
-	it("drives a round from an unanswered advisor finding even when the reviewer accepts", async () => {
+	it("drives a round from an unanswered advisor finding without consulting the reviewer", async () => {
 		const branch = [user("u1"), assistant("a1", "done"), advisorNote("n1", "missing test", "concern")];
 		const host = createHost(branch);
 		advisorConsensus(host.api);
 		await host.emit("session_start", {});
 		await host.commands.get("adversarial")!.handler("on", host.ctx);
-		host.queueReview(metReply());
 
 		const result = (await host.emit("session_stop", stopEvent)) as { continue?: boolean; additionalContext?: string };
 
 		expect(result.continue).toBe(true);
 		expect(result.additionalContext).toContain("1. [concern] missing test");
+		expect(host.reviewPrompts).toHaveLength(0);
 		expect(host.appended.at(-1)).toMatchObject({ data: { round: 1, seen: { "missing test": 1 } } });
 	});
 
@@ -512,7 +512,6 @@ describe("host wiring", () => {
 		await host.emit("agent_end", {});
 
 		branch.push(advisorNote("n2", "late gap", "concern"));
-		host.queueReview(unmetReply("late gap"));
 		await host.emit("message_end", {
 			message: { role: "custom", customType: "advisor", content: "", details: { notes: [{ note: "late gap" }] } },
 		});
@@ -522,6 +521,7 @@ describe("host wiring", () => {
 		const injected = host.sent[0] as { message: { content: string }; options: { triggerTurn: boolean } };
 		expect(injected.message.content).toContain("late gap");
 		expect(injected.options.triggerTurn).toBe(true);
+		expect(host.reviewPrompts).toHaveLength(0);
 		expect(host.appended.at(-1)).toMatchObject({ data: { round: 3 } });
 		expect(host.notifications.map(entry => entry.message).join("\n")).toContain("late advisor finding reopened round 3/100");
 	});

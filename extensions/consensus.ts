@@ -32,6 +32,7 @@ import {
 	buildRoundNotice,
 	buildStallNotice,
 	ADVISOR_CUSTOM_TYPE,
+	blockingAdvisorFindings,
 	decideAtStop,
 	describeReview,
 	lastAssistantAnswer,
@@ -102,6 +103,7 @@ interface SessionState {
 	warnedDisabled: boolean;
 	warnedUnavailable: boolean;
 	warnedAdvisorOff: boolean;
+	warnedNoAdvisorHandle: boolean;
 	/** A reviewer turn is in flight; never start a second one. */
 	reviewing: boolean;
 	/** Live `advisor.enabled`; undefined when the host has no advisor settings. */
@@ -150,6 +152,7 @@ function stateFor(sessionId: string): SessionState {
 			warnedDisabled: false,
 			warnedUnavailable: false,
 			warnedAdvisorOff: false,
+			warnedNoAdvisorHandle: false,
 			reviewing: false,
 			advisorEnabled: undefined,
 			syncPolicy: undefined,
@@ -366,22 +369,31 @@ function ensureAdvisor(
 	ctx: ExtensionContext,
 	config: ConsensusConfig,
 ): void {
+	if (!config.enabled || !config.includeAdvisor) return;
 	const host = advisorSettings();
 	const enabled = host.enabled?.get(pi.pi.settings);
 	state.advisorEnabled = typeof enabled === "boolean" ? enabled : undefined;
-	if (!config.enabled || !config.includeAdvisor || state.advisorEnabled !== false || state.advisorForceAttempted) {
+	if (state.advisorForceAttempted) return;
+	state.advisorForceAttempted = true;
+	if (!host.enabled) {
+		if (!state.warnedNoAdvisorHandle) {
+			state.warnedNoAdvisorHandle = true;
+			ctx.ui.notify(
+				"advisor-consensus: this host exposes no advisor.enabled setting; the independent reviewer still gates the goal.",
+				"warning",
+			);
+		}
 		return;
 	}
-	state.advisorForceAttempted = true;
-	if (!host.enabled) return;
+	if (enabled === true) return;
 	host.enabled.override(pi.pi.settings, true);
 	state.forcedAdvisor = true;
 	refreshAdvisorState(pi, state);
-	const nowEnabled = host.enabled?.get(pi.pi.settings) === true;
+	const nowEnabled = host.enabled.get(pi.pi.settings) === true;
 	pi.logger.debug("advisor-consensus forced advisor on", { advisorEnabled: nowEnabled });
 	if (nowEnabled) {
 		ctx.ui.notify(
-			"advisor-consensus: advisor was off; enabled it for this session so its notes supplement the reviewer.",
+			"advisor-consensus: advisor enabled for this session — its findings drive the rounds, the reviewer is the final gate.",
 			"info",
 		);
 	}
@@ -602,14 +614,16 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 		if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
 
 		const entries = ctx.sessionManager.getBranch();
-		state.reviewing = true;
+		const advisorFindings = blockingAdvisorFindings(entries, config);
 		let review: ReviewResult | undefined;
-		try {
-			review = await runReview(ctx, state);
-		} finally {
-			state.reviewing = false;
+		if (advisorFindings.length === 0) {
+			state.reviewing = true;
+			try {
+				review = await runReview(ctx, state);
+			} finally {
+				state.reviewing = false;
+			}
 		}
-		if (!review) return;
 		const decision = decideAtStop({
 			entries,
 			config,
@@ -760,14 +774,19 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 		const anchor = scan.lastUserEntryId ?? scan.ledger?.anchor ?? "session";
 		if (scan.ledger?.anchor === anchor && scan.ledger.settled) return;
 
-		state.reviewing = true;
+		// The advisor drives the round when it has unanswered findings; the
+		// independent reviewer is the final gate that runs when it has nothing
+		// left to say (or when the advisor is off/excluded).
+		const advisorFindings = blockingAdvisorFindings(entries, config);
 		let review: ReviewResult | undefined;
-		try {
-			review = await runReview(ctx, state);
-		} finally {
-			state.reviewing = false;
+		if (advisorFindings.length === 0) {
+			state.reviewing = true;
+			try {
+				review = await runReview(ctx, state);
+			} finally {
+				state.reviewing = false;
+			}
 		}
-		if (!review) return;
 
 		const decision = decideAtStop({ entries, config, lastAssistant, review });
 		switch (decision.kind) {
@@ -808,6 +827,7 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 			const enable = (): void => {
 				state.overrideEnabled = true;
 				state.paused = false;
+				state.advisorForceAttempted = false;
 				pi.appendEntry(ARM_TYPE, { armed: true });
 				const config = effectiveConfig(ctx.cwd, state);
 				updateStatus(ctx, state, config, "armed");

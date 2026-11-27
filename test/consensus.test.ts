@@ -281,6 +281,33 @@ describe("decision at the settle boundary", () => {
 		});
 	});
 
+	it("continues on advisor findings even when no reviewer verdict exists", () => {
+		const branch = entries(
+			user("u1"),
+			assistant("a1", "done"),
+			advisorNote("n1", [{ note: "missing test", severity: "concern" }]),
+		);
+		expect(
+			decideAtStop({ entries: branch, config: config(), lastAssistant: { text: "done" }, review: undefined }),
+		).toMatchObject({ kind: "continue", round: 1, findings: [{ text: "missing test", severity: "concern" }] });
+	});
+
+	it("leaves the gate to the reviewer when advisor findings are below the floor", () => {
+		const branch = entries(
+			user("u1"),
+			assistant("a1", "done"),
+			advisorNote("n1", [{ note: "rename it", severity: "nit" }]),
+		);
+		expect(
+			decideAtStop({
+				entries: branch,
+				config: config({ minSeverity: "concern" }),
+				lastAssistant: { text: "done" },
+				review: undefined,
+			}),
+		).toEqual({ kind: "ignore", reason: "no-review", round: 0 });
+	});
+
 	it("ignores advisor stop calls and excludes the advisor when configured", () => {
 		const branch = entries(
 			user("u1"),

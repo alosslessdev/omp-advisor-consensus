@@ -1,6 +1,6 @@
 {
 	"name": "omp-advisor-consensus",
-	"version": "0.3.0",
+	"version": "0.3.1",
 	"description": "Self-contained adversarial goal loop with an independent reviewer, optionally supplemented by omp advisor notes, that re-prompts until the goal is met",
 	"type": "module",
 	"license": "MIT",
@@ -30,7 +30,7 @@
 		".omp-plugin/"
 	],
 	"omp": {
-		"description": "Run an independent reviewer after every turn (plus unanswered advisor notes when the advisor is on) and re-prompt the main session until the goal is met. No escalation: the loop stops only on an accepted goal or an explicit pause/off.",
+		"description": "Advisor-driven adversarial loop: unanswered advisor notes re-prompt the main session, and an independent reviewer gates the goal when the advisor is silent. Arming turns the advisor on. No escalation.",
 		"extensions": [
 			"./extensions/consensus.ts"
 		],
