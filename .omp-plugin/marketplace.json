@@ -5,16 +5,16 @@
 		"url": "https://github.com/alosslessdev"
 	},
 	"metadata": {
-		"description": "Adversarial advisor convergence for omp: bounded reprompt/steer loop until advisor and agent agree",
-		"version": "0.1.0"
+		"description": "Self-contained adversarial goal loop for omp: an independent reviewer re-prompts the agent until the goal is met",
+		"version": "0.2.0"
 	},
 	"plugins": [
 		{
 			"name": "advisor-consensus",
 			"source": "./",
-			"description": "Turns unanswered advisor findings into continuation turns and re-reviews until the advisor is silent and the agent claims closure. Adds /adversarial (on / off / pause / resume) and a per-prompt convergence ledger.",
+			"description": "Runs its own reviewer turn after every agent turn and re-prompts the main session while the goal is unmet. Adds /adversarial (on / off / pause / resume / review) and a per-prompt ledger. No advisor dependency and no escalation path.",
 			"category": "productivity",
-			"version": "0.1.0",
+			"version": "0.2.0",
 			"author": {
 				"name": "alosslessdev"
 			},
@@ -22,10 +22,10 @@
 			"repository": "https://github.com/alosslessdev/omp-advisor-consensus",
 			"license": "MIT",
 			"keywords": [
-				"advisor",
 				"convergence",
 				"review",
-				"watchdog"
+				"goal",
+				"ralph-loop"
 			]
 		}
 	]

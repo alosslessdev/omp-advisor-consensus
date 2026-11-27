@@ -1,7 +1,7 @@
 {
 	"name": "omp-advisor-consensus",
-	"version": "0.1.0",
-	"description": "Adversarial advisor convergence loop: reprompt and steer the agent on advisor findings until both agree and every item is closed",
+	"version": "0.2.0",
+	"description": "Self-contained adversarial goal loop: an independent reviewer turn re-prompts the agent until the goal is actually met",
 	"type": "module",
 	"license": "MIT",
 	"repository": {
@@ -17,11 +17,10 @@
 		"oh-my-pi",
 		"plugin",
 		"extension",
-		"advisor",
-		"watchdog",
 		"convergence",
 		"ralph-loop",
-		"review"
+		"review",
+		"goal"
 	],
 	"files": [
 		"extensions/",
@@ -30,7 +29,7 @@
 		".omp-plugin/"
 	],
 	"omp": {
-		"description": "Turn unanswered advisor findings into a bounded adversarial loop: reprompt the agent, re-review, repeat until the advisor is silent and the agent claims closure",
+		"description": "Run an independent reviewer after every turn and re-prompt the main session until the goal is met. No advisor dependency, no escalation: the loop stops only on an accepted goal or an explicit pause/off.",
 		"extensions": [
 			"./extensions/consensus.ts"
 		],
@@ -48,7 +47,7 @@
 					"blocker"
 				],
 				"default": "nit",
-				"description": "Lowest advisor finding severity that keeps the loop running."
+				"description": "Lowest reviewer finding severity that keeps the loop running."
 			},
 			"maxRounds": {
 				"type": "number",
@@ -56,7 +55,7 @@
 				"min": 1,
 				"max": 100,
 				"step": 1,
-				"description": "Continuation turns this plugin may spend on one user prompt."
+				"description": "Soft budget of continuation turns per user prompt. Crossing it raises pressure and notifies; it never hands the goal back."
 			},
 			"maxRepeats": {
 				"type": "number",
@@ -64,27 +63,12 @@
 				"min": 1,
 				"max": 10,
 				"step": 1,
-				"description": "Times the advisor may re-raise the same finding before the loop escalates to the operator."
-			},
-			"forceSyncBacklog": {
-				"type": "boolean",
-				"default": true,
-				"description": "Pin advisor.syncBacklog to strict while the loop is armed, so an empty review really means agreement."
-			},
-			"useSessionModel": {
-				"type": "boolean",
-				"default": true,
-				"description": "Default the advisor's model to the session's live model instead of the advisor role's slow chain. An explicitly configured modelRoles.advisor or WATCHDOG model still wins."
-			},
-			"requireStopCall": {
-				"type": "boolean",
-				"default": true,
-				"description": "Strict agreement: only an explicit advise(note: \"[converged] ...\") closes the loop; advisor silence escalates. Pair it with the WATCHDOG.md guidance in examples/ so the advisor knows the protocol."
+				"description": "Times the reviewer may re-raise the same finding before the next round runs under stall pressure."
 			},
 			"notify": {
 				"type": "boolean",
 				"default": true,
-				"description": "Toast each round, convergence, and escalation."
+				"description": "Toast each round, convergence, stall pressure, and budget crossing."
 			}
 		}
 	},

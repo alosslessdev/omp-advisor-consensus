@@ -6,36 +6,23 @@ const TS = "2026-01-01T00:00:00.000Z";
 
 type Handler = (event: Record<string, unknown>, ctx: unknown) => unknown;
 
-function user(id: string) {
+function user(id: string, text = "do the work") {
 	return {
 		type: "message",
 		id,
 		parentId: null,
 		timestamp: TS,
-		message: { role: "user", content: [{ type: "text", text: "do the work" }] },
+		message: { role: "user", content: [{ type: "text", text }] },
 	};
 }
 
-function assistant(id: string, text: string) {
+function assistant(id: string, text: string, stopReason = "stop") {
 	return {
 		type: "message",
 		id,
 		parentId: null,
 		timestamp: TS,
-		message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" },
-	};
-}
-
-function advisorNote(id: string, note: string, severity?: string) {
-	return {
-		type: "custom_message",
-		id,
-		parentId: null,
-		timestamp: TS,
-		customType: "advisor",
-		content: "",
-		display: true,
-		details: { notes: [{ note, ...(severity ? { severity } : {}) }] },
+		message: { role: "assistant", content: [{ type: "text", text }], stopReason },
 	};
 }
 
@@ -43,12 +30,20 @@ function ledger(id: string, data: Record<string, unknown>) {
 	return { type: "custom", id, parentId: null, timestamp: TS, customType: "advisor-consensus", data };
 }
 
+function metReply(): string {
+	return '<review>{"goal_met": true, "goal": "do the work", "findings": []}</review>';
+}
+
+function unmetReply(text: string, severity = "concern"): string {
+	return `<review>${JSON.stringify({ goal_met: false, findings: [{ severity, text }] })}</review>`;
+}
+
 /**
  * Minimal host double: records registrations and replays the events the
- * session emits. The cast lands here, once, because the double implements only
- * the surfaces this plugin touches.
+ * session emits. `runEphemeralTurn` is the plugin's reviewer, so the double
+ * answers from a queued script instead of calling a model.
  */
-function createHost(branch: unknown[]) {
+function createHost(branch: unknown[], options: { reviewer?: boolean } = {}) {
 	const handlers = new Map<string, Handler[]>();
 	const appended: Array<{ type: string; data: unknown }> = [];
 	const notifications: Array<{ message: string; level: string | undefined }> = [];
@@ -57,7 +52,18 @@ function createHost(branch: unknown[]) {
 	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
 	const selectAnswers: string[] = [];
 	const inputAnswers: string[] = [];
+	const reviewPrompts: string[] = [];
+	const reviewReplies: string[] = [];
 	let idle = true;
+
+	const reviewer = {
+		async runEphemeralTurn(reviewOptions: { promptText: string }) {
+			reviewPrompts.push(reviewOptions.promptText);
+			const reply = reviewReplies.shift();
+			if (reply === undefined) throw new Error("no reviewer reply queued");
+			return { replyText: reply, assistantMessage: {} };
+		},
+	};
 
 	const ctx = {
 		agent: { kind: "main", id: "main", name: "main", depth: 0 },
@@ -65,10 +71,7 @@ function createHost(branch: unknown[]) {
 		mode: "print",
 		isIdle: () => idle,
 		hasPendingMessages: () => false,
-		// Deterministic: the plugin schedules its catch-up through this context
-		// timer, so running it inline keeps the test free of wall-clock waits.
-		setTimeout(callback: () => void) {
-			callback();
+		setTimeout() {
 			return 1;
 		},
 		setInterval() {
@@ -90,6 +93,7 @@ function createHost(branch: unknown[]) {
 				return inputAnswers.shift();
 			},
 		},
+		...(options.reviewer === false ? {} : reviewer),
 	};
 
 	const api = {
@@ -109,8 +113,8 @@ function createHost(branch: unknown[]) {
 		appendEntry(type: string, data: unknown) {
 			appended.push({ type, data });
 		},
-		sendMessage(message: unknown, options: unknown) {
-			sent.push({ message, options });
+		sendMessage(message: unknown, sendOptions: unknown) {
+			sent.push({ message, options: sendOptions });
 		},
 		pi: { settings: {} },
 	};
@@ -128,6 +132,7 @@ function createHost(branch: unknown[]) {
 		emit,
 		appended,
 		sent,
+		reviewPrompts,
 		setIdle(value: boolean) {
 			idle = value;
 		},
@@ -137,64 +142,71 @@ function createHost(branch: unknown[]) {
 		queueInput(...answers: string[]) {
 			inputAnswers.push(...answers);
 		},
+		queueReview(...replies: string[]) {
+			reviewReplies.push(...replies);
+		},
 		notifications,
 		statuses,
 		commands,
 	};
 }
 
-const stopEvent = { messages: [assistant("a9", "all done")], stop_hook_active: false, turn_id: 1, session_id: "s1" };
+const stopEvent = { messages: [], stop_hook_active: false, turn_id: 1, session_id: "s1" };
 
 describe("host wiring", () => {
 	it("stays inert until the user arms it", async () => {
-		const branch = [user("u1"), assistant("a1", "done"), advisorNote("n1", "missing test", "concern")];
-		const host = createHost(branch);
+		const host = createHost([user("u1"), assistant("a1", "done")]);
 		advisorConsensus(host.api);
 		await host.emit("session_start", {});
+		host.queueReview(metReply());
 
 		const result = await host.emit("session_stop", stopEvent);
 
 		expect(result).toBeUndefined();
+		expect(host.reviewPrompts).toHaveLength(0);
 		expect(host.appended).toHaveLength(0);
 		expect(host.sent).toHaveLength(0);
 		expect(host.notifications.at(-1)?.message).toContain("advisor-consensus: off");
 	});
 
-	it("spends round 1 as a host continuation carrying the ledger", async () => {
-		const branch = [user("u1"), assistant("a1", "done"), advisorNote("n1", "missing test", "concern")];
-		const host = createHost(branch);
+	it("spends round 1 as a host continuation carrying the reviewer's findings", async () => {
+		const host = createHost([user("u1"), assistant("a1", "done")]);
 		advisorConsensus(host.api);
 		await host.emit("session_start", {});
 		await host.commands.get("adversarial")!.handler("on", host.ctx);
+		host.queueReview(unmetReply("missing test"));
 
 		const result = (await host.emit("session_stop", stopEvent)) as {
 			continue?: boolean;
 			additionalContext?: string;
 		};
 
+		expect(host.reviewPrompts).toHaveLength(1);
+		expect(host.reviewPrompts[0]).toContain("<goal>\ndo the work\n</goal>");
 		expect(result.continue).toBe(true);
-		expect(result.additionalContext).toContain('<advisor-consensus round="1" max_rounds="100">');
+		expect(result.additionalContext).toContain('<adversarial-review round="1" max_rounds="100">');
 		expect(result.additionalContext).toContain("1. [concern] missing test");
+		expect(result.additionalContext).not.toContain("escalat");
 		expect(host.sent).toHaveLength(0);
 
 		expect(host.appended.filter(entry => entry.type === "advisor-consensus")).toEqual([
-			{ type: "advisor-consensus", data: { v: 1, anchor: "u1", round: 1, seen: { "missing test": 1 } } },
+			{ type: "advisor-consensus", data: { v: 2, anchor: "u1", round: 1, seen: { "missing test": 1 } } },
 		]);
 		expect(host.statuses.at(-1)).toEqual(["advisor-consensus", "adversarial 1/100 · 1 open"]);
 		expect(host.notifications.at(-1)?.message).toContain("round 1/100");
 	});
 
-	it("shows the live budget in the status line as soon as it is armed", async () => {
+	it("shows the live soft budget in the status line as soon as it is armed", async () => {
 		const host = createHost([user("u1"), assistant("a1", "done")]);
 		advisorConsensus(host.api);
 		await host.emit("session_start", {});
 
 		await host.commands.get("adversarial")!.handler("on", host.ctx);
-		expect(host.statuses.at(-1)?.[1]).toBe("adversarial on · 100 rounds · repeats 3");
+		expect(host.statuses.at(-1)?.[1]).toBe("adversarial on · 100 rounds (soft) · repeats 3");
 
 		await host.commands.get("adversarial")!.handler("max 12", host.ctx);
 		await host.commands.get("adversarial")!.handler("repeats 5", host.ctx);
-		expect(host.statuses.at(-1)?.[1]).toBe("adversarial on · 12 rounds · repeats 5");
+		expect(host.statuses.at(-1)?.[1]).toBe("adversarial on · 12 rounds (soft) · repeats 5");
 	});
 
 	it("re-arms from the transcript after a resume", async () => {
@@ -202,11 +214,11 @@ describe("host wiring", () => {
 			user("u1"),
 			{ type: "custom", id: "arm1", parentId: null, timestamp: TS, customType: "advisor-consensus-arm", data: { armed: true } },
 			assistant("a1", "done"),
-			advisorNote("n1", "missing test", "concern"),
 		];
 		const host = createHost(branch);
 		advisorConsensus(host.api);
 		await host.emit("session_start", {});
+		host.queueReview(unmetReply("missing test"));
 
 		// No `/adversarial on` in this process: the branch says it was armed.
 		const result = (await host.emit("session_stop", stopEvent)) as { continue?: boolean };
@@ -219,53 +231,107 @@ describe("host wiring", () => {
 			user("u1"),
 			{ type: "custom", id: "arm1", parentId: null, timestamp: TS, customType: "advisor-consensus-arm", data: { armed: false } },
 			assistant("a1", "done"),
-			advisorNote("n1", "missing test", "concern"),
 		];
 		const host = createHost(branch);
 		advisorConsensus(host.api);
 		await host.emit("session_start", {});
+		host.queueReview(unmetReply("missing test"));
 
 		expect(await host.emit("session_stop", stopEvent)).toBeUndefined();
+		expect(host.reviewPrompts).toHaveLength(0);
 		expect(host.sent).toHaveLength(0);
 	});
 
-	it("settles once the advisor is silent and records the converged episode", async () => {
+	it("converges when the reviewer accepts the goal", async () => {
 		const branch = [
 			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 1, seen: { "missing test": 1 } }),
-			advisorNote("n1", "missing test", "concern"),
+			ledger("l1", { v: 2, anchor: "u1", round: 1, seen: { "missing test": 1 } }),
 			assistant("a2", "added the test"),
 		];
 		const host = createHost(branch);
 		advisorConsensus(host.api);
 		await host.emit("session_start", {});
 		await host.commands.get("adversarial")!.handler("on", host.ctx);
-		await host.commands.get("adversarial")!.handler("require-stop off", host.ctx);
+		host.queueReview(metReply());
 
-		const result = await host.emit("session_stop", {
-			messages: [assistant("a2", "added the test")],
-			stop_hook_active: true,
-			turn_id: 2,
-			session_id: "s1",
-		});
+		const result = await host.emit("session_stop", stopEvent);
 
 		expect(result).toBeUndefined();
 		expect(host.appended.at(-1)).toEqual({
 			type: "advisor-consensus",
-			data: { v: 1, anchor: "u1", round: 1, seen: { "missing test": 1 }, settled: "converged" },
+			data: { v: 2, anchor: "u1", round: 1, seen: { "missing test": 1 }, settled: "converged" },
 		});
 		expect(host.statuses.at(-1)).toEqual(["advisor-consensus", "adversarial converged · 1/100"]);
-		expect(host.notifications.at(-1)?.message).toContain("converged after 1 round(s)");
+		expect(host.notifications.at(-1)?.message).toContain("met after 1 round(s)");
 	});
 
-	it("escalates instead of converging when a strict episode ends on silence", async () => {
+	it("keeps re-prompting past the soft budget instead of escalating", async () => {
 		const branch = [
 			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 1, seen: {} }),
-			advisorNote("n1", "fixed"),
-			assistant("a2", "done"),
+			ledger("l1", { v: 2, anchor: "u1", round: 2, seen: {} }),
+			assistant("a1", "done"),
 		];
 		const host = createHost(branch);
+		advisorConsensus(host.api);
+		await host.emit("session_start", {});
+		const command = host.commands.get("adversarial")!;
+		await command.handler("on", host.ctx);
+		await command.handler("max 2", host.ctx);
+		host.queueReview(unmetReply("another problem", "nit"));
+
+		const result = (await host.emit("session_stop", stopEvent)) as { continue?: boolean; additionalContext?: string };
+
+		expect(result.continue).toBe(true);
+		expect(result.additionalContext).toContain("<budget>Round 3 exceeds the soft budget of 2");
+		expect(result.additionalContext).toContain("the loop does not hand off");
+		expect(host.appended.at(-1)).toMatchObject({ data: { round: 3 } });
+		expect((host.appended.at(-1) as { data: Record<string, unknown> }).data.settled).toBeUndefined();
+		expect(
+			host.notifications.filter(entry => entry.message.includes("soft budget of 2 round(s) spent at round 3")),
+		).toHaveLength(1);
+		expect(host.statuses.at(-1)?.[1]).toBe("adversarial 3/2 · 1 open");
+	});
+
+	it("raises stall pressure when the reviewer repeats itself", async () => {
+		const branch = [
+			user("u1"),
+			ledger("l1", { v: 2, anchor: "u1", round: 3, seen: { "missing test": 3 }, stalls: 1 }),
+			assistant("a1", "done"),
+		];
+		const host = createHost(branch);
+		advisorConsensus(host.api);
+		await host.emit("session_start", {});
+		await host.commands.get("adversarial")!.handler("on", host.ctx);
+		host.queueReview(unmetReply("missing test"));
+
+		const result = (await host.emit("session_stop", stopEvent)) as { continue?: boolean; additionalContext?: string };
+
+		expect(result.continue).toBe(true);
+		expect(result.additionalContext).toContain('<stall tier="2">');
+		expect(host.appended.at(-1)).toMatchObject({ data: { round: 4, stalls: 2 } });
+		expect(host.statuses.at(-1)?.[1]).toBe("adversarial 4/100 · 1 open · stall 2");
+		expect(host.notifications.some(entry => entry.message.includes("stall pressure 2"))).toBe(true);
+	});
+
+	it("does not continue when the reviewer reply never parses", async () => {
+		const host = createHost([user("u1"), assistant("a1", "done")]);
+		advisorConsensus(host.api);
+		await host.emit("session_start", {});
+		await host.commands.get("adversarial")!.handler("on", host.ctx);
+		host.queueReview("looks fine to me", "{still not json");
+
+		const result = await host.emit("session_stop", stopEvent);
+
+		expect(result).toBeUndefined();
+		expect(host.reviewPrompts).toHaveLength(2);
+		expect(host.reviewPrompts[1]).toContain("could not be parsed");
+		expect(host.appended.filter(entry => entry.type === "advisor-consensus")).toHaveLength(0);
+		expect(host.notifications.at(-1)?.level).toBe("warning");
+		expect(host.notifications.at(-1)?.message).toContain("unusable");
+	});
+
+	it("does not continue when the reviewer turn itself fails", async () => {
+		const host = createHost([user("u1"), assistant("a1", "done")]);
 		advisorConsensus(host.api);
 		await host.emit("session_start", {});
 		await host.commands.get("adversarial")!.handler("on", host.ctx);
@@ -273,13 +339,24 @@ describe("host wiring", () => {
 		const result = await host.emit("session_stop", stopEvent);
 
 		expect(result).toBeUndefined();
-		expect(host.notifications.at(-1)?.message).toContain("stayed silent instead of calling [converged]");
-		expect(host.appended.at(-1)).toMatchObject({ data: { settled: "escalated" } });
+		expect(host.reviewPrompts).toHaveLength(2);
+		expect(host.notifications.at(-1)?.message).toContain("no reviewer reply queued");
+	});
+
+	it("does not review an interrupted turn", async () => {
+		const branch = [user("u1"), assistant("a1", "stopped", "aborted")];
+		const host = createHost(branch);
+		advisorConsensus(host.api);
+		await host.emit("session_start", {});
+		await host.commands.get("adversarial")!.handler("on", host.ctx);
+		host.queueReview(unmetReply("missing test"));
+
+		expect(await host.emit("session_stop", stopEvent)).toBeUndefined();
+		expect(host.reviewPrompts).toHaveLength(0);
 	});
 
 	it("stops acting while paused and picks the same round back up on resume", async () => {
-		const branch = [user("u1"), assistant("a1", "done"), advisorNote("n1", "missing test", "concern")];
-		const host = createHost(branch);
+		const host = createHost([user("u1"), assistant("a1", "done")]);
 		advisorConsensus(host.api);
 		await host.emit("session_start", {});
 
@@ -287,7 +364,9 @@ describe("host wiring", () => {
 		await command.handler("on", host.ctx);
 		await command.handler("pause", host.ctx);
 		expect(host.statuses.at(-1)?.[1]).toBe("adversarial paused · 0/100");
+		host.queueReview(unmetReply("missing test"));
 		expect(await host.emit("session_stop", stopEvent)).toBeUndefined();
+		expect(host.reviewPrompts).toHaveLength(0);
 		expect(host.appended.filter(entry => entry.type === "advisor-consensus")).toHaveLength(0);
 
 		await command.handler("resume", host.ctx);
@@ -297,7 +376,7 @@ describe("host wiring", () => {
 	});
 
 	it("cancels an in-flight episode when turned off", async () => {
-		const branch = [user("u1"), ledger("l1", { v: 1, anchor: "u1", round: 2, seen: {} }), assistant("a1", "working")];
+		const branch = [user("u1"), ledger("l1", { v: 2, anchor: "u1", round: 2, seen: {} }), assistant("a1", "working")];
 		const host = createHost(branch);
 		advisorConsensus(host.api);
 		await host.emit("session_start", {});
@@ -309,7 +388,7 @@ describe("host wiring", () => {
 		expect(host.appended.filter(entry => entry.type === "advisor-consensus")).toEqual([
 			{
 				type: "advisor-consensus",
-				data: { v: 1, anchor: "u1", round: 2, seen: {}, settled: "cancelled" },
+				data: { v: 2, anchor: "u1", round: 2, seen: {}, settled: "cancelled" },
 			},
 		]);
 		expect(host.appended.filter(entry => entry.type === "advisor-consensus-arm")).toEqual([
@@ -321,39 +400,7 @@ describe("host wiring", () => {
 		expect(await host.emit("session_stop", stopEvent)).toBeUndefined();
 	});
 
-	it("reopens a converged episode when the advisor raises a late note", async () => {
-		const branch = [
-			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 1, seen: { "missing test": 1 }, settled: "converged" }),
-			assistant("a2", "added the test\n<convergence>\nverdict: closed\n</convergence>"),
-			advisorNote("n3", "late nit: rename the helper", "nit"),
-		];
-		const host = createHost(branch);
-		advisorConsensus(host.api);
-		await host.emit("session_start", {});
-		await host.commands.get("adversarial")!.handler("on", host.ctx);
-
-		await host.emit("agent_start", {});
-		await host.emit("agent_end", {});
-		await host.emit("message_end", {
-			message: { role: "custom", customType: "advisor", content: "", details: { notes: [{ note: "x" }] } },
-		});
-		expect(host.sent).toHaveLength(1);
-		const injected = host.sent[0] as {
-			message: { content: string; customType: string; display: boolean };
-			options: { triggerTurn: boolean };
-		};
-		expect(injected.message.customType).toBe("advisor-consensus");
-		expect(injected.message.display).toBe(false);
-		expect(injected.message.content).toContain("late nit: rename the helper");
-		expect(injected.options.triggerTurn).toBe(true);
-		expect(host.appended.at(-1)).toMatchObject({ data: { round: 2 } });
-		expect(host.notifications.map(entry => entry.message).join("\n")).toContain(
-			"late finding reopened round 2/100",
-		);
-	});
-
-	it("switches from host continuations to steered rounds once the stop-hook budget is spent", async () => {
+	it("switches to steered rounds once the stop-hook budget is spent", async () => {
 		const branch: unknown[] = [user("u1"), assistant("a1", "work")];
 		const host = createHost(branch);
 		advisorConsensus(host.api);
@@ -361,10 +408,10 @@ describe("host wiring", () => {
 		await host.commands.get("adversarial")!.handler("on", host.ctx);
 
 		for (let round = 1; round <= 7; round++) {
-			branch.push(advisorNote(`n${round}`, `finding ${round}`, "concern"));
-			const result = await host.emit("session_stop", stopEvent);
+			host.queueReview(unmetReply(`finding ${round}`));
+			const result = (await host.emit("session_stop", stopEvent)) as { continue?: boolean } | undefined;
 			if (round < 7) {
-				expect(result).toBeDefined();
+				expect(result?.continue).toBe(true);
 			} else {
 				// Round 7 is past the six host continuations this plugin spends, so it
 				// is held until the loop actually ends and then steered in as a turn.
@@ -372,50 +419,56 @@ describe("host wiring", () => {
 				expect(host.sent).toHaveLength(0);
 				await host.emit("agent_end", {});
 				expect(host.sent).toHaveLength(1);
-				const injected = host.sent[0] as { options: { triggerTurn: boolean } };
+				const injected = host.sent[0] as { message: { content: string }; options: { triggerTurn: boolean } };
+				expect(injected.message.content).toContain(`round="7"`);
 				expect(injected.options.triggerTurn).toBe(true);
 			}
 			branch.push(assistant(`a${round + 10}`, `answer ${round}`));
-			branch.push(ledger(`l${round}`, { v: 1, anchor: "u1", round, seen: {} }));
+			const appended = host.appended.filter(entry => entry.type === "advisor-consensus").at(-1);
+			branch.push(ledger(`l${round}`, appended!.data as Record<string, unknown>));
 		}
 
 		expect(host.appended.at(-1)).toMatchObject({ data: { round: 7 } });
 		expect(host.statuses.at(-1)?.[1]).toBe("adversarial 7/100 · 1 open");
 	});
 
-	it("honors a per-session round budget", async () => {
-		const branch = [
-			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 2, seen: {} }),
-			assistant("a1", "done"),
-			advisorNote("n1", "another problem", "nit"),
-		];
-		const host = createHost(branch);
+	it("answers /adversarial review with a verdict and spends a round when armed", async () => {
+		const host = createHost([user("u1"), assistant("a1", "done")]);
 		advisorConsensus(host.api);
 		await host.emit("session_start", {});
+		await host.commands.get("adversarial")!.handler("on", host.ctx);
+		host.queueReview(unmetReply("missing verification", "blocker"));
 
-		const command = host.commands.get("adversarial")!;
-		await command.handler("on", host.ctx);
-		await command.handler("max 2", host.ctx);
-		const result = await host.emit("session_stop", stopEvent);
+		await host.commands.get("adversarial")!.handler("review", host.ctx);
 
-		expect(result).toBeUndefined();
-		expect(host.notifications.at(-1)?.level).toBe("warning");
-		expect(host.notifications.at(-1)?.message).toContain("round budget exhausted after 2 round(s)");
-		expect(host.appended.at(-1)).toMatchObject({ data: { settled: "escalated" } });
+		expect(host.notifications.some(entry => entry.message.includes("goal NOT met"))).toBe(true);
+		expect(host.notifications.some(entry => entry.message.includes("[blocker] missing verification"))).toBe(true);
+		expect(host.sent).toHaveLength(1);
+		expect(host.appended.at(-1)).toMatchObject({ data: { round: 1 } });
 	});
 
-	it("edits the live budget from the TUI editor", async () => {
+	it("reports a missing reviewer API instead of looking broken", async () => {
+		const host = createHost([user("u1"), assistant("a1", "done")], { reviewer: false });
+		advisorConsensus(host.api);
+		await host.emit("session_start", {});
+		await host.commands.get("adversarial")!.handler("on", host.ctx);
+
+		expect(await host.emit("session_stop", stopEvent)).toBeUndefined();
+		expect(host.notifications.some(entry => entry.message.includes("does not expose ctx.runEphemeralTurn"))).toBe(true);
+		expect(host.appended.filter(entry => entry.type === "advisor-consensus")).toHaveLength(0);
+	});
+
+	it("edits the live soft budget from the TUI editor", async () => {
 		const host = createHost([user("u1"), assistant("a1", "done")]);
 		advisorConsensus(host.api);
 		await host.emit("session_start", {});
 		await host.commands.get("adversarial")!.handler("on", host.ctx);
 		host.ctx.mode = "tui";
-		host.queueSelect("Max rounds: 100", "Done");
+		host.queueSelect("Soft max rounds: 100", "Done");
 		host.queueInput("7");
 
 		await host.commands.get("adversarial")!.handler("config", host.ctx);
 
-		expect(host.statuses.at(-1)?.[1]).toBe("adversarial on · 7 rounds · repeats 3");
+		expect(host.statuses.at(-1)?.[1]).toBe("adversarial on · 7 rounds (soft) · repeats 3");
 	});
 });

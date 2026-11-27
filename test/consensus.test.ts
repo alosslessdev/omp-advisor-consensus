@@ -1,21 +1,21 @@
 import { describe, expect, it } from "bun:test";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent";
 import {
-	assistantText,
 	buildConvergedNotice,
-	buildEscalationNotice,
 	buildRemediationPrompt,
+	buildReviewerPrompt,
 	decideAtStop,
 	DEFAULT_CONFIG,
+	describeReview,
 	findingKey,
-	findingsFromEntry,
+	lastUserText,
 	LEDGER_TYPE,
-	parseAdvisorContent,
-	parseVerdict,
-	pendingFindings,
+	parseReview,
 	resolveConfig,
+	resolveEnvConfig,
 	scanEntries,
 	type ConsensusConfig,
+	type ReviewResult,
 } from "../extensions/consensus-core";
 
 const TS = "2026-01-01T00:00:00.000Z";
@@ -48,31 +48,6 @@ function assistant(id: string, text: string, stopReason = "stop") {
 	};
 }
 
-function noteWithDetails(id: string, notes: Array<{ note: string; severity?: string; advisor?: string }>) {
-	return {
-		type: "custom_message",
-		id,
-		parentId: null,
-		timestamp: TS,
-		customType: "advisor",
-		content: "",
-		display: true,
-		details: { notes },
-	};
-}
-
-function noteWithContent(id: string, content: string) {
-	return {
-		type: "custom_message",
-		id,
-		parentId: null,
-		timestamp: TS,
-		customType: "advisor",
-		content,
-		display: true,
-	};
-}
-
 function ledger(id: string, data: Record<string, unknown>) {
 	return { type: "custom", id, parentId: null, timestamp: TS, customType: LEDGER_TYPE, data };
 }
@@ -83,333 +58,266 @@ const config = (overrides: Partial<ConsensusConfig> = {}): ConsensusConfig => ({
 	...overrides,
 });
 
-describe("transcript scan", () => {
-	it("treats only notes after the last assistant message as unanswered", () => {
-		const branch = entries(
-			user("u1"),
-			noteWithDetails("a1", [{ note: "steered mid-run" }]),
-			assistant("a2", "did the work"),
-			noteWithDetails("a3", [{ note: "raised at the boundary" }]),
+const review = (overrides: Partial<ReviewResult> = {}): ReviewResult => ({
+	goalMet: true,
+	findings: [],
+	...overrides,
+});
+
+const notMet = (...findings: Array<{ text: string; severity?: "nit" | "concern" | "blocker" }>): ReviewResult => ({
+	goalMet: false,
+	findings: findings.map(finding => ({ text: finding.text, severity: finding.severity ?? "concern" })),
+});
+
+describe("reviewer reply parsing", () => {
+	it("reads the wrapped JSON block and normalizes severities", () => {
+		const parsed = parseReview(
+			'<review>{"goal_met": false, "goal": "ship it", "summary": "one gap", "findings": [{"severity": "BLOCKER", "text": " no test "}]}</review>',
 		);
-		expect(pendingFindings(branch).map(finding => finding.text)).toEqual(["raised at the boundary"]);
+		expect(parsed).toEqual({
+			ok: true,
+			result: {
+				goalMet: false,
+				goal: "ship it",
+				summary: "one gap",
+				findings: [{ text: "no test", severity: "blocker" }],
+			},
+		});
 	});
 
-	it("anchors on the last user message and keeps the ledger", () => {
-		const branch = entries(
-			user("u1"),
-			assistant("a1", "done"),
-			ledger("l1", { v: 1, anchor: "u1", round: 2, seen: { stop: 1 } }),
-		);
-		const scan = scanEntries(branch);
-		expect(scan.lastUserEntryId).toBe("u1");
-		expect(scan.lastAssistant).toBe(1);
-		expect(scan.ledger?.round).toBe(2);
-		expect(scan.ledger?.seen).toEqual({ stop: 1 });
+	it("accepts a fenced block or a bare JSON object", () => {
+		const fenced = parseReview('Here you go:\n```json\n{"goal_met": true}\n```\n');
+		expect(fenced.ok && fenced.result.goalMet).toBe(true);
+		const bare = parseReview('Verdict: {"goal_met": false, "findings": []} — done.');
+		expect(bare.ok && bare.result.goalMet).toBe(false);
 	});
 
-	it("reads advisor details first and falls back to the advisory XML", () => {
-		const fromDetails = findingsFromEntry(
-			entries(noteWithDetails("a1", [{ note: " use the queue ", severity: "blocker", advisor: "Arch" }]))[0]!,
-		);
-		expect(fromDetails).toEqual([{ text: "use the queue", severity: "blocker", advisor: "Arch" }]);
-
-		const fromXml = parseAdvisorContent(
-			'<advisory advisor="Arch" severity="concern">\nWrap &lt;stdout&gt; writes\n</advisory>\n<advisory>plain nit</advisory>',
-		);
-		expect(fromXml).toEqual([
-			{ text: "Wrap <stdout> writes", severity: "concern", advisor: "Arch" },
-			{ text: "plain nit", severity: "nit" },
-		]);
+	it("rejects an unusable reply instead of guessing", () => {
+		expect(parseReview("")).toMatchObject({ ok: false });
+		expect(parseReview("looks good to me")).toMatchObject({ ok: false });
+		expect(parseReview("<review>{not json}</review>")).toMatchObject({ ok: false });
+		expect(parseReview('<review>{"findings": []}</review>')).toMatchObject({ ok: false });
 	});
 
-	it("extracts the final answer text from assistant blocks", () => {
-		expect(assistantText({ role: "assistant", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] })).toBe(
-			"a\nb",
+	it("skips malformed findings but keeps the verdict", () => {
+		const parsed = parseReview(
+			'<review>{"goal_met": false, "findings": [{"text": "  "}, {"severity": "concern"}, {"text": "real gap"}]}</review>',
 		);
-		expect(assistantText({ role: "assistant", content: [] })).toBe("");
+		expect(parsed.ok && parsed.result.findings).toEqual([{ text: "real gap", severity: "nit" }]);
 	});
 });
 
-describe("settle decisions", () => {
-	it("opens round 1 on the first unanswered finding", () => {
-		const branch = entries(user("u1"), assistant("a1", "done"), noteWithDetails("n1", [{ note: "missing test" }]));
+describe("decision at the settle boundary", () => {
+	it("converges only when the reviewer accepts the goal", () => {
+		const branch = entries(user("u1"), ledger("l1", { v: 2, anchor: "u1", round: 1, seen: { x: 1 } }), assistant("a1", "ok"));
+		expect(decideAtStop({ entries: branch, config: config(), lastAssistant: { text: "ok" }, review: review() })).toEqual({
+			kind: "converged",
+			round: 1,
+			ledger: { anchor: "u1", round: 1, seen: { x: 1 }, settled: "converged" },
+		});
+	});
+
+	it("continues with a ledgered round when findings remain", () => {
+		const branch = entries(user("u1"), assistant("a1", "done"));
 		const decision = decideAtStop({
 			entries: branch,
 			config: config(),
-			lastAssistant: { text: "done", stopReason: "stop" },
+			lastAssistant: { text: "done" },
+			review: notMet({ text: "missing test" }),
 		});
-
-		expect(decision.kind).toBe("continue");
-		if (decision.kind !== "continue") return;
-		expect(decision.round).toBe(1);
-		expect(decision.findings[0]?.text).toBe("missing test");
-		expect(decision.ledger).toEqual({ anchor: "u1", round: 1, seen: { "missing test": 1 } });
+		expect(decision).toEqual({
+			kind: "continue",
+			findings: [{ text: "missing test", severity: "concern" }],
+			round: 1,
+			repeated: [],
+			budgetSpent: false,
+			ledger: { anchor: "u1", round: 1, seen: { "missing test": 1 } },
+		});
 	});
 
-	it("ignores findings below the configured severity floor", () => {
-		const branch = entries(user("u1"), assistant("a1", "done"), noteWithDetails("n1", [{ note: "typo in helper" }]));
+	it("treats findings as unmet even when the verdict claims success", () => {
+		const branch = entries(user("u1"), assistant("a1", "done"));
+		const decision = decideAtStop({
+			entries: branch,
+			config: config(),
+			lastAssistant: { text: "done" },
+			review: review({ findings: [{ text: "still broken", severity: "blocker" }] }),
+		});
+		expect(decision.kind).toBe("continue");
+	});
+
+	it("keeps looping on a bare unmet verdict with no itemized findings", () => {
+		const branch = entries(user("u1"), assistant("a1", "done"));
+		const decision = decideAtStop({
+			entries: branch,
+			config: config(),
+			lastAssistant: { text: "done" },
+			review: review({ goalMet: false }),
+		});
+		expect(decision).toMatchObject({ kind: "continue", findings: [], round: 1 });
+	});
+
+	it("drops findings below the severity floor", () => {
+		const branch = entries(user("u1"), assistant("a1", "done"));
 		const decision = decideAtStop({
 			entries: branch,
 			config: config({ minSeverity: "concern" }),
 			lastAssistant: { text: "done" },
-		});
-		expect(decision).toEqual({ kind: "ignore", reason: "no-findings", round: 0 });
-	});
-
-	it("declares convergence when the advisor stays silent after a round", () => {
-		const branch = entries(
-			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 1, seen: { "missing test": 1 } }),
-			noteWithDetails("n1", [{ note: "missing test" }]),
-			assistant("a1", "added the test\n<convergence>\n1: fixed — test added\nverdict: closed\n</convergence>"),
-		);
-		const decision = decideAtStop({
-			entries: branch,
-			config: config({ requireStopCall: false }),
-			lastAssistant: { text: "added the test" },
+			review: review({ goalMet: false, findings: [{ text: "rename it", severity: "nit" }] }),
 		});
 		expect(decision.kind).toBe("converged");
-		if (decision.kind !== "converged") return;
-		expect(decision.round).toBe(1);
-		expect(decision.ledger.settled).toBe("converged");
 	});
 
-	it("does not call it convergence when the agent admits open work", () => {
-		const branch = entries(
+	it("ignores an episode that already settled, an error turn, and a missing review", () => {
+		const settled = entries(
 			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 1, seen: {} }),
-			assistant("a1", "<convergence>\nverdict: open\n</convergence>"),
-		);
-		const decision = decideAtStop({
-			entries: branch,
-			config: config({ requireStopCall: false }),
-			lastAssistant: { text: "<convergence>\nverdict: open\n</convergence>" },
-		});
-		expect(decision.kind).toBe("escalate");
-		if (decision.kind !== "escalate") return;
-		expect(decision.reason).toBe("agent-open");
-		expect(decision.ledger.settled).toBe("escalated");
-	});
-
-	it("closes the loop when the advisor calls stop through advise", () => {
-		const branch = entries(
-			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 1, seen: { "missing test": 1 } }),
-			assistant("a1", "<convergence>\nverdict: open\n</convergence>"),
-			noteWithDetails("n1", [{ note: "[converged] every finding is fixed or rebutted" }]),
-		);
-		const decision = decideAtStop({
-			entries: branch,
-			config: config(),
-			lastAssistant: { text: "<convergence>\nverdict: open\n</convergence>" },
-		});
-		expect(decision.kind).toBe("converged");
-		if (decision.kind !== "converged") return;
-		expect(decision.viaStopCall).toBe(true);
-		expect(buildConvergedNotice(decision.round, decision.viaStopCall)).toContain("advisor called stop");
-	});
-
-	it("requires the advisor's stop call by default", () => {
-		const branch = entries(
-			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 2, seen: {} }),
-			assistant("a2", "done"),
-		);
-		expect(decideAtStop({ entries: branch, config: config(), lastAssistant: { text: "done" } })).toMatchObject({
-			kind: "escalate",
-			reason: "advisor-silent",
-		});
-	});
-
-	it("escalates on advisor silence only when the stop call is required", () => {
-		const branch = entries(
-			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 2, seen: {} }),
-			noteWithDetails("n1", [{ note: "fixed it" }]),
-			assistant("a2", "done"),
-		);
-		expect(
-			decideAtStop({ entries: branch, config: config({ requireStopCall: true }), lastAssistant: { text: "done" } }),
-		).toMatchObject({ kind: "escalate", reason: "advisor-silent" });
-		expect(
-			decideAtStop({ entries: branch, config: config({ requireStopCall: false }), lastAssistant: { text: "done" } }),
-		).toMatchObject({ kind: "converged" });
-	});
-
-	it("lets the advisor's stop call close the loop even when a stop call is required", () => {
-		const branch = entries(
-			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 2, seen: {} }),
+			ledger("l1", { v: 2, anchor: "u1", round: 2, seen: {}, settled: "converged" }),
 			assistant("a1", "done"),
-			noteWithDetails("n1", [{ note: "[converged] nothing left to raise" }]),
+		);
+		expect(decideAtStop({ entries: settled, config: config(), lastAssistant: { text: "done" }, review: review() })).toEqual({
+			kind: "ignore",
+			reason: "settled",
+			round: 2,
+		});
+
+		const aborted = entries(user("u1"), assistant("a1", "interrupted", "aborted"));
+		expect(
+			decideAtStop({ entries: aborted, config: config(), lastAssistant: { text: "", stopReason: "aborted" }, review: notMet({ text: "x" }) }),
+		).toEqual({ kind: "ignore", reason: "error-turn", round: 0 });
+
+		const clean = entries(user("u1"), assistant("a1", "done"));
+		expect(decideAtStop({ entries: clean, config: config(), lastAssistant: { text: "done" }, review: undefined })).toEqual({
+			kind: "ignore",
+			reason: "no-review",
+			round: 0,
+		});
+	});
+
+	it("raises stall pressure once a finding repeats past the limit", () => {
+		const branch = entries(
+			user("u1"),
+			ledger("l1", { v: 2, anchor: "u1", round: 3, seen: { "missing test": 3 }, stalls: 1 }),
+			assistant("a1", "done"),
 		);
 		const decision = decideAtStop({
 			entries: branch,
-			config: config({ requireStopCall: true }),
+			config: config({ maxRepeats: 3 }),
 			lastAssistant: { text: "done" },
+			review: notMet({ text: "Missing test!" }),
 		});
-		expect(decision).toMatchObject({ kind: "converged", viaStopCall: true });
-	});
-
-	it("ignores a stop call that arrives alongside an open finding", () => {
-		const branch = entries(
-			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 1, seen: {} }),
-			assistant("a1", "done"),
-			noteWithDetails("n1", [{ note: "[converged] looks fine" }, { note: "but the test is missing" }]),
-		);
-		const decision = decideAtStop({ entries: branch, config: config(), lastAssistant: { text: "done" } });
-		expect(decision.kind).toBe("continue");
-		if (decision.kind !== "continue") return;
-		expect(decision.findings.map(finding => finding.text)).toEqual(["but the test is missing"]);
-	});
-
-	it("escalates when the advisor re-raises the same finding past maxRepeats", () => {
-		const branch = entries(
-			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 2, seen: { "missing test": 2 } }),
-			assistant("a1", "done twice"),
-			noteWithDetails("n1", [{ note: "Missing test." }]),
-		);
-		const decision = decideAtStop({
-			entries: branch,
-			config: config({ maxRepeats: 2 }),
-			lastAssistant: { text: "done twice" },
+		expect(decision).toMatchObject({
+			kind: "continue",
+			round: 4,
+			repeated: [{ text: "Missing test!", severity: "concern" }],
+			ledger: { stalls: 2, seen: { "missing test": 4 } },
 		});
-		expect(decision.kind).toBe("escalate");
-		if (decision.kind !== "escalate") return;
-		expect(decision.reason).toBe("repeated");
 	});
 
-	it("escalates when the round budget is spent", () => {
+	it("keeps going past the soft budget instead of handing off", () => {
 		const branch = entries(
 			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 2, seen: {} }),
+			ledger("l1", { v: 2, anchor: "u1", round: 2, seen: {} }),
 			assistant("a1", "done"),
-			noteWithDetails("n1", [{ note: "a brand new problem" }]),
 		);
 		const decision = decideAtStop({
 			entries: branch,
 			config: config({ maxRounds: 2 }),
 			lastAssistant: { text: "done" },
+			review: notMet({ text: "still broken" }),
 		});
-		expect(decision.kind).toBe("escalate");
-		if (decision.kind !== "escalate") return;
-		expect(decision.reason).toBe("rounds-exhausted");
-		expect(decision.findings.map(finding => finding.text)).toEqual(["a brand new problem"]);
+		expect(decision).toMatchObject({ kind: "continue", round: 3, budgetSpent: true });
 	});
 
-	it("never continues an errored or aborted turn", () => {
-		const branch = entries(user("u1"), assistant("a1", "boom"), noteWithDetails("n1", [{ note: "still broken" }]));
-		for (const stopReason of ["error", "aborted"]) {
-			expect(
-				decideAtStop({ entries: branch, config: config(), lastAssistant: { text: "boom", stopReason } }),
-			).toEqual({ kind: "ignore", reason: "error-turn", round: 0 });
-		}
-	});
-
-	it("does not reopen a settled episode", () => {
+	it("reads a legacy v1 escalated ledger as a closed episode", () => {
 		const branch = entries(
 			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 1, seen: {}, settled: "converged" }),
+			ledger("l1", { v: 1, anchor: "u1", round: 4, seen: {}, settled: "escalated" }),
 			assistant("a1", "done"),
-			noteWithDetails("n1", [{ note: "late card" }]),
 		);
-		expect(decideAtStop({ entries: branch, config: config(), lastAssistant: { text: "done" } })).toEqual({
+		const scan = scanEntries(branch);
+		expect(scan.ledger).toMatchObject({ v: 2, round: 4, settled: "cancelled" });
+		expect(decideAtStop({ entries: branch, config: config(), lastAssistant: { text: "done" }, review: review() })).toMatchObject({
 			kind: "ignore",
 			reason: "settled",
-			round: 1,
 		});
 	});
 
-	it("starts a fresh episode when the user sends a new prompt", () => {
+	it("anchors on the last user message", () => {
 		const branch = entries(
 			user("u1"),
-			ledger("l1", { v: 1, anchor: "u1", round: 3, seen: {} }),
-			assistant("a1", "done"),
-			user("u2", "next task"),
-			assistant("a2", "did it"),
-			noteWithDetails("n1", [{ note: "new finding" }]),
+			assistant("a1", "first"),
+			user("u2", "second request"),
+			assistant("a2", "done"),
+			ledger("l1", { v: 2, anchor: "u1", round: 5, seen: {} }),
 		);
-		const decision = decideAtStop({
-			entries: branch,
-			config: config({ maxRounds: 4 }),
-			lastAssistant: { text: "did it" },
-		});
-		expect(decision.kind).toBe("continue");
-		if (decision.kind !== "continue") return;
-		expect(decision.round).toBe(1);
-		expect(decision.ledger.anchor).toBe("u2");
+		expect(lastUserText(branch)).toBe("second request");
+		expect(
+			decideAtStop({ entries: branch, config: config(), lastAssistant: { text: "done" }, review: notMet({ text: "gap" }) }),
+		).toMatchObject({ kind: "continue", round: 1, ledger: { anchor: "u2" } });
 	});
 });
 
-describe("continuation protocol", () => {
-	it("numbers every finding and demands per-item closure", () => {
-		const prompt = buildRemediationPrompt(
-			[
-				{ text: "missing test", severity: "concern", advisor: "Arch" },
-				{ text: "leaks a handle", severity: "blocker" },
-			],
-			1,
-			4,
-		);
-		expect(prompt).toContain('<advisor-consensus round="1" max_rounds="4">');
-		expect(prompt).toContain('1. [concern] advisor="Arch" missing test');
-		expect(prompt).toContain("2. [blocker] leaks a handle");
-		expect(prompt).toContain("2: fixed | rebutted | blocked");
-		expect(prompt).toContain("verdict: closed | open");
-		expect(prompt).not.toContain("This is the final round");
+describe("prompts and notices", () => {
+	it("asks the reviewer for a machine-readable verdict against the goal", () => {
+		const prompt = buildReviewerPrompt("add a regression test");
+		expect(prompt).toContain("<goal>\nadd a regression test\n</goal>");
+		expect(prompt).toContain("goal_met");
+		expect(prompt).toContain("<review>");
+		expect(buildReviewerPrompt(undefined, { strict: true })).toContain("could not be parsed");
 	});
 
-	it("warns on the final round", () => {
-		expect(buildRemediationPrompt([{ text: "x", severity: "nit" }], 4, 4)).toContain(
-			"This is the final round (4 of 4)",
-		);
+	it("carries the findings, the report protocol, and no self-certification", () => {
+		const prompt = buildRemediationPrompt([{ text: "missing test", severity: "concern" }], 2, 10);
+		expect(prompt).toContain('<adversarial-review round="2" max_rounds="10">');
+		expect(prompt).toContain("1. [concern] missing test");
+		expect(prompt).toContain("1: fixed | rebutted | blocked");
+		expect(prompt).not.toContain("verdict:");
+		expect(prompt.toLowerCase()).not.toContain("escalat");
 	});
 
-	it("reads the last verdict block only", () => {
-		expect(parseVerdict("<convergence>\nverdict: open\n</convergence>\n...\n<convergence>\nverdict: closed\n</convergence>")).toBe(
-			"closed",
-		);
-		expect(parseVerdict("no block here")).toBeUndefined();
+	it("adds stall pressure and the over-budget note", () => {
+		const prompt = buildRemediationPrompt([{ text: "missing test", severity: "concern" }], 11, 10, {
+			tier: 2,
+			repeated: [{ text: "missing test", severity: "concern" }],
+			repeatedLimit: 3,
+		});
+		expect(prompt).toContain('<stall tier="2">');
+		expect(prompt).toContain("Repetition is failure");
+		expect(prompt).toContain("<budget>Round 11 exceeds the soft budget of 10");
 	});
 
-	it("summarizes escalations without dropping the findings", () => {
-		const notice = buildEscalationNotice("repeated", [{ text: "  missing test  ", severity: "concern" }], 2);
-		expect(notice).toContain("re-raised the same finding after 2 round(s)");
-		expect(notice).toContain("1. [concern] missing test");
+	it("reports convergence and manual verdicts plainly", () => {
+		expect(buildConvergedNotice(0)).toContain("no continuation needed");
+		expect(buildConvergedNotice(3)).toContain("met after 3 round(s)");
+		expect(describeReview(notMet({ text: "gap", severity: "blocker" }, { text: "nit", severity: "nit" }))).toContain(
+			"1. [blocker] gap\n2. [nit] nit",
+		);
+		expect(describeReview(review({ goal: "do the work" }))).toContain("goal met — do the work");
 	});
 });
 
-describe("configuration", () => {
-	it("normalizes identities the same way the advisor guard does", () => {
-		expect(findingKey("Stop.")).toBe(findingKey("  *STOP*  "));
-		expect(findingKey("Missing test.")).toBe("missing test");
+describe("settings resolution", () => {
+	it("clamps config values and ignores unknown severities", () => {
+		expect(
+			resolveConfig({ enabled: true, maxRounds: 500, maxRepeats: 0, minSeverity: "severe", notify: "yes" }),
+		).toEqual({ enabled: true, minSeverity: "nit", maxRounds: 100, maxRepeats: 1, notify: true });
 	});
 
-	it("clamps and validates plugin settings and env overrides", () => {
-		const fromSettings = resolveConfig(
-			{ maxRounds: "99", minSeverity: "BLOCKER", enabled: "no", forceSyncBacklog: "off", notify: "yes" },
-			{},
-		);
-		expect(fromSettings).toMatchObject({
-			maxRounds: 99,
-			minSeverity: "blocker",
-			enabled: false,
-			forceSyncBacklog: false,
-			notify: true,
-		});
+	it("applies environment overrides for one process", () => {
+		expect(
+			resolveEnvConfig({
+				OMP_ADVISOR_CONSENSUS_ENABLED: "on",
+				OMP_ADVISOR_CONSENSUS_MAX_ROUNDS: "7",
+				OMP_ADVISOR_CONSENSUS_MAX_REPEATS: "2",
+				OMP_ADVISOR_CONSENSUS_MIN_SEVERITY: "blocker",
+				OMP_ADVISOR_CONSENSUS_NOTIFY: "off",
+			}),
+		).toEqual({ enabled: true, minSeverity: "blocker", maxRounds: 7, maxRepeats: 2, notify: false });
+	});
+});
 
-		const fromEnv = resolveConfig(
-			{ maxRounds: 2, minSeverity: "concern" },
-			{ OMP_ADVISOR_CONSENSUS_MAX_ROUNDS: "3", OMP_ADVISOR_CONSENSUS_MIN_SEVERITY: "nit" },
-		);
-		expect(fromEnv.maxRounds).toBe(3);
-		expect(fromEnv.minSeverity).toBe("nit");
-
-		expect(resolveConfig({ maxRounds: "abc", minSeverity: "nope" }, {})).toMatchObject({
-			maxRounds: DEFAULT_CONFIG.maxRounds,
-			minSeverity: DEFAULT_CONFIG.minSeverity,
-		});
+describe("finding identity", () => {
+	it("collapses punctuation and case so paraphrases still count", () => {
+		expect(findingKey("  Missing  TEST!! ")).toBe("missing test");
 	});
 });
