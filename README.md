@@ -1,14 +1,18 @@
 # omp-advisor-consensus
 
-A self-contained adversarial goal loop for omp. After every agent turn the
-plugin runs **its own reviewer turn** over the live conversation and asks one
-question: was the user's goal actually met? If not, the main session is
-re-prompted with the reviewer's findings and the loop repeats.
+An adversarial goal loop for omp. After every agent turn the plugin runs **its
+own reviewer turn** over the live conversation and asks one question: was the
+user's goal actually met? If not, the main session is re-prompted with the
+findings and the loop repeats.
 
-There is **no dependency on omp's advisor subsystem**, and there is **no
-escalation path**: an unmet goal never gets handed back to the operator as a
-failure state. The episode ends only when the reviewer accepts the goal, or when
-you pause/stop the loop.
+When omp's **advisor** is on, its unanswered notes are a second, independent
+source of findings: the goal is accepted only when the reviewer says it is met
+**and** the advisor has nothing left unanswered. The reviewer still works with
+the advisor off, so the loop has no hard dependency on it.
+
+There is **no escalation path**: an unmet goal never gets handed back to the
+operator as a failure state. The episode ends only when both sources agree, or
+when you pause/stop the loop.
 
 Think Ralph loop (`while not done: run again`) with a second pass of the same
 model as the termination oracle, a per-prompt ledger, stall pressure, and an
@@ -51,6 +55,8 @@ silently doing nothing.
 /adversarial max 12       # soft budget for this session (1..100)
 /adversarial repeats 4    # re-raises of one finding before stall pressure (1..10)
 /adversarial severity concern
+/adversarial advisor on    # count advisor notes as findings (default)
+/adversarial advisor off   # reviewer-only; ignore advisor notes
 ```
 
 Arming is recorded in the session transcript, so `/adversarial on` survives
@@ -86,7 +92,7 @@ user prompt
     v
 agent turn  --->  own reviewer turn (ephemeral, same model + context)
     |                    |
-    |             goal met?
+    |             goal met?  +  no unanswered advisor notes?
     |                    |
     |             yes ---+--- no
     |             |           |
@@ -95,6 +101,10 @@ agent turn  --->  own reviewer turn (ephemeral, same model + context)
     |                        |
     +------------------------+   (round++, budget is soft)
 ```
+
+Optionally, the advisor reviews each turn in parallel; its notes after the last
+assistant message are merged into the same finding list, deduped by normalized
+text at the higher severity.
 
 The reviewer sees the same conversation the agent saw and is told to default to
 "not met" unless the transcript shows the work and its verification. It replies
@@ -128,6 +138,32 @@ quitting on its own. This plugin does not do that:
 Interrupted (`aborted`) and provider-errored turns are never reviewed, so
 Ctrl-C stops the loop for that turn instead of starting another.
 
+### Advisor notes (second source)
+
+With `includeAdvisor` (default on) and a working advisor:
+
+- **Unanswered advisor notes count.** A note that lands after the last assistant
+  message becomes a finding even when the reviewer would accept the goal. The
+  continuation lists it with `advisor="<name>"`.
+- **`[converged]` is not a finding.** The advisor's reserved `advise` stop call
+  is filtered out; agreement is still the reviewer's call, so an advisor stop
+  does not close the loop on its own.
+- **`syncBacklog` is pinned to `strict`** while armed (`forceSyncBacklog`), so a
+  scheduled advisor review is not still in flight when the verdict is taken.
+  `/adversarial sync` is gone; the pin is released on off/shutdown.
+- **The advisor model follows the session** (`useSessionModel`) unless
+  `modelRoles.advisor` is configured explicitly or a `WATCHDOG.yml` roster entry
+  names its own model. Sweep `/adversarial advisor off` to go reviewer-only.
+- **Arming turns a disabled advisor on for the session** (runtime override, not
+  persisted) so its notes exist to supplement the reviewer. Turning it back off
+  with `/advisor off` is respected.
+- **Late notes are caught.** If a note arrives after the run settled, the plugin
+  re-runs the reviewer for up to ten minutes; an unmet goal reopens the
+  converged episode and steers another round.
+
+The advisor needs `advisor.enabled: true` and a resolvable `advisor` model role
+(or a `WATCHDOG.yml` roster). Without it, the loop is reviewer-only and says so.
+
 ### What the agent sees
 
 Each continuation carries a machine-shaped block, not a paraphrase:
@@ -158,24 +194,31 @@ past the budget add a `<budget>` block.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Arm the loop. Off until you turn it on. |
-| `minSeverity` | `nit` | Lowest finding severity that keeps the loop running. |
+| `minSeverity` | `nit` | Lowest finding severity (reviewer or advisor) that keeps the loop running. |
 | `maxRounds` | `100` | Soft budget of continuations per user prompt (1..100). |
 | `maxRepeats` | `3` | Re-raises of one finding before stall pressure (1..10). |
-| `notify` | `true` | Toast each round, convergence, stall, and budget crossing. |
+| `includeAdvisor` | `true` | Count unanswered advisor notes alongside the reviewer. |
+| `forceSyncBacklog` | `true` | Pin `advisor.syncBacklog: strict` while armed. |
+| `useSessionModel` | `true` | Default the advisor model to the session's live model. |
+| `notify` | `true` | Toast each round, convergence, stall, budget, late reopen. |
 
 Env overrides for one process: `OMP_ADVISOR_CONSENSUS_ENABLED`,
 `OMP_ADVISOR_CONSENSUS_MIN_SEVERITY`, `OMP_ADVISOR_CONSENSUS_MAX_ROUNDS`,
-`OMP_ADVISOR_CONSENSUS_MAX_REPEATS`, `OMP_ADVISOR_CONSENSUS_NOTIFY`.
+`OMP_ADVISOR_CONSENSUS_MAX_REPEATS`, `OMP_ADVISOR_CONSENSUS_INCLUDE_ADVISOR`,
+`OMP_ADVISOR_CONSENSUS_FORCE_SYNC_BACKLOG`,
+`OMP_ADVISOR_CONSENSUS_USE_SESSION_MODEL`, `OMP_ADVISOR_CONSENSUS_NOTIFY`.
 
-### Reviewer model
+### Models
 
 The reviewer runs through `ctx.runEphemeralTurn`, so it uses the session's live
-model and honors `/model` switches. No advisor role, no `WATCHDOG.yml`, no model
-pinning: the adversarial pair is the same model arguing with itself.
+model and honors `/model` switches. The advisor, when included, is pinned to the
+same live model by default so both sides argue from the same capability floor;
+an explicitly configured `modelRoles.advisor` or WATCHDOG roster model wins.
 
 ## When it stays out of the way
 
 - loop not armed
+- advisor notes excluded (`/adversarial advisor off`)
 - plan mode active
 - errored or aborted turns
 - sessions that are not the main agent (subagents, task children)
@@ -188,8 +231,9 @@ pinning: the adversarial pair is the same model arguing with itself.
 - Rounds 1-6 ride the host's `session_stop` continuation (capped at 8 per
   prompt, shared with other stop hooks). Later rounds are steered from
   `agent_end` as agent-initiated turns, which is what lets the budget reach 100.
-- Each round costs one agent turn **plus one reviewer turn**. `maxRepeats`
-  usually ends a deadlock with pressure far sooner than the budget.
+- Each round costs one agent turn **plus one reviewer turn**, plus the advisor's
+  review when it is enabled. `maxRepeats` usually ends a deadlock with pressure
+  far sooner than the budget.
 - The reviewer judges the transcript, not the filesystem. It cannot run commands
   (ephemeral tool calls are discarded by the host); it can only refuse claims
   the transcript does not back.
@@ -197,6 +241,8 @@ pinning: the adversarial pair is the same model arguing with itself.
   passes; stall pressure still escalates the wording each time.
 - Headless `-p` sessions settle the same way; `/adversarial review` gives you a
   manual nudge when there is no turn to hook.
+- Advisor notes are read from transcript entries (`customType: "advisor"`), so
+  anything the host delivers as an advisor note is in scope.
 
 ## State and audit
 
@@ -207,9 +253,10 @@ Each round appends a `custom` session entry:
 ```
 
 `anchor` scopes the episode to one user prompt, so a new prompt starts a fresh
-budget and a resumed session continues an interrupted episode. Ledger `v: 1`
-entries from the advisor-based versions are still read; a legacy
-`settled: "escalated"` is treated as a closed episode, never reopened.
+budget and a resumed session continues an interrupted episode. Advisor findings
+are not duplicated into the ledger; they are re-read from the transcript each
+round. Ledger `v: 1` entries are still read; a legacy `settled: "escalated"` is
+treated as a closed episode, never reopened.
 
 ## Development
 

@@ -1,7 +1,7 @@
 {
 	"name": "omp-advisor-consensus",
-	"version": "0.2.0",
-	"description": "Self-contained adversarial goal loop: an independent reviewer turn re-prompts the agent until the goal is actually met",
+	"version": "0.3.0",
+	"description": "Self-contained adversarial goal loop with an independent reviewer, optionally supplemented by omp advisor notes, that re-prompts until the goal is met",
 	"type": "module",
 	"license": "MIT",
 	"repository": {
@@ -17,6 +17,7 @@
 		"oh-my-pi",
 		"plugin",
 		"extension",
+		"advisor",
 		"convergence",
 		"ralph-loop",
 		"review",
@@ -29,7 +30,7 @@
 		".omp-plugin/"
 	],
 	"omp": {
-		"description": "Run an independent reviewer after every turn and re-prompt the main session until the goal is met. No advisor dependency, no escalation: the loop stops only on an accepted goal or an explicit pause/off.",
+		"description": "Run an independent reviewer after every turn (plus unanswered advisor notes when the advisor is on) and re-prompt the main session until the goal is met. No escalation: the loop stops only on an accepted goal or an explicit pause/off.",
 		"extensions": [
 			"./extensions/consensus.ts"
 		],
@@ -47,7 +48,7 @@
 					"blocker"
 				],
 				"default": "nit",
-				"description": "Lowest reviewer finding severity that keeps the loop running."
+				"description": "Lowest finding severity (reviewer or advisor) that keeps the loop running."
 			},
 			"maxRounds": {
 				"type": "number",
@@ -68,7 +69,22 @@
 			"notify": {
 				"type": "boolean",
 				"default": true,
-				"description": "Toast each round, convergence, stall pressure, and budget crossing."
+				"description": "Toast each round, convergence, stall pressure, budget crossing, and late advisor reopen."
+			},
+			"includeAdvisor": {
+				"type": "boolean",
+				"default": true,
+				"description": "Count unanswered advisor notes as findings alongside the reviewer. Requires the advisor subsystem; off means reviewer-only."
+			},
+			"forceSyncBacklog": {
+				"type": "boolean",
+				"default": true,
+				"description": "Pin advisor.syncBacklog to strict while armed, so a scheduled advisor review is not still in flight when the verdict is taken."
+			},
+			"useSessionModel": {
+				"type": "boolean",
+				"default": true,
+				"description": "Default the advisor's model to the session's live model. An explicitly configured modelRoles.advisor or WATCHDOG model still wins."
 			}
 		}
 	},

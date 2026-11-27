@@ -26,6 +26,19 @@ function assistant(id: string, text: string, stopReason = "stop") {
 	};
 }
 
+function advisorNote(id: string, note: string, severity?: string) {
+	return {
+		type: "custom_message",
+		id,
+		parentId: null,
+		timestamp: TS,
+		customType: "advisor",
+		content: "",
+		display: true,
+		details: { notes: [{ note, ...(severity ? { severity } : {}) }] },
+	};
+}
+
 function ledger(id: string, data: Record<string, unknown>) {
 	return { type: "custom", id, parentId: null, timestamp: TS, customType: "advisor-consensus", data };
 }
@@ -54,6 +67,8 @@ function createHost(branch: unknown[], options: { reviewer?: boolean } = {}) {
 	const inputAnswers: string[] = [];
 	const reviewPrompts: string[] = [];
 	const reviewReplies: string[] = [];
+	const timers = new Map<number, () => unknown>();
+	let timerSeq = 0;
 	let idle = true;
 
 	const reviewer = {
@@ -71,13 +86,17 @@ function createHost(branch: unknown[], options: { reviewer?: boolean } = {}) {
 		mode: "print",
 		isIdle: () => idle,
 		hasPendingMessages: () => false,
-		setTimeout() {
-			return 1;
+		setTimeout(callback: () => unknown) {
+			const id = ++timerSeq;
+			timers.set(id, callback);
+			return id;
 		},
 		setInterval() {
-			return 1;
+			return 0;
 		},
-		clearTimer() {},
+		clearTimer(handle: unknown) {
+			timers.delete(handle as number);
+		},
 		sessionManager: { getSessionId: () => "s1", getBranch: () => branch },
 		ui: {
 			notify(message: string, level?: string) {
@@ -133,6 +152,11 @@ function createHost(branch: unknown[], options: { reviewer?: boolean } = {}) {
 		appended,
 		sent,
 		reviewPrompts,
+		async runTimers() {
+			const pending = [...timers.values()];
+			timers.clear();
+			await Promise.all(pending.map(callback => callback()));
+		},
 		setIdle(value: boolean) {
 			idle = value;
 		},
@@ -430,6 +454,76 @@ describe("host wiring", () => {
 
 		expect(host.appended.at(-1)).toMatchObject({ data: { round: 7 } });
 		expect(host.statuses.at(-1)?.[1]).toBe("adversarial 7/100 · 1 open");
+	});
+
+	it("drives a round from an unanswered advisor finding even when the reviewer accepts", async () => {
+		const branch = [user("u1"), assistant("a1", "done"), advisorNote("n1", "missing test", "concern")];
+		const host = createHost(branch);
+		advisorConsensus(host.api);
+		await host.emit("session_start", {});
+		await host.commands.get("adversarial")!.handler("on", host.ctx);
+		host.queueReview(metReply());
+
+		const result = (await host.emit("session_stop", stopEvent)) as { continue?: boolean; additionalContext?: string };
+
+		expect(result.continue).toBe(true);
+		expect(result.additionalContext).toContain("1. [concern] missing test");
+		expect(host.appended.at(-1)).toMatchObject({ data: { round: 1, seen: { "missing test": 1 } } });
+	});
+
+	it("converges on an advisor stop call and ignores advisor notes when excluded", async () => {
+		const branch = [
+			user("u1"),
+			assistant("a1", "done"),
+			advisorNote("n1", "[converged] every finding is closed"),
+		];
+		const host = createHost(branch);
+		advisorConsensus(host.api);
+		await host.emit("session_start", {});
+		await host.commands.get("adversarial")!.handler("on", host.ctx);
+		host.queueReview(metReply());
+
+		expect(await host.emit("session_stop", stopEvent)).toBeUndefined();
+		expect(host.appended.at(-1)).toMatchObject({ data: { settled: "converged" } });
+
+		const excluded = createHost([user("u1"), assistant("a1", "done"), advisorNote("n1", "missing test", "concern")]);
+		advisorConsensus(excluded.api);
+		await excluded.emit("session_start", {});
+		await excluded.commands.get("adversarial")!.handler("on", excluded.ctx);
+		await excluded.commands.get("adversarial")!.handler("advisor off", excluded.ctx);
+		excluded.queueReview(metReply());
+
+		expect(await excluded.emit("session_stop", stopEvent)).toBeUndefined();
+		expect(excluded.appended.at(-1)).toMatchObject({ data: { settled: "converged" } });
+		expect(excluded.notifications.some(entry => entry.message.includes("advisor notes ignored"))).toBe(true);
+	});
+
+	it("reopens a converged episode for a late advisor note", async () => {
+		const branch: unknown[] = [
+			user("u1"),
+			ledger("l1", { v: 2, anchor: "u1", round: 2, seen: {}, settled: "converged" }),
+			assistant("a2", "done"),
+		];
+		const host = createHost(branch);
+		advisorConsensus(host.api);
+		await host.emit("session_start", {});
+		await host.commands.get("adversarial")!.handler("on", host.ctx);
+		await host.emit("agent_start", {});
+		await host.emit("agent_end", {});
+
+		branch.push(advisorNote("n2", "late gap", "concern"));
+		host.queueReview(unmetReply("late gap"));
+		await host.emit("message_end", {
+			message: { role: "custom", customType: "advisor", content: "", details: { notes: [{ note: "late gap" }] } },
+		});
+		await host.runTimers();
+
+		expect(host.sent).toHaveLength(1);
+		const injected = host.sent[0] as { message: { content: string }; options: { triggerTurn: boolean } };
+		expect(injected.message.content).toContain("late gap");
+		expect(injected.options.triggerTurn).toBe(true);
+		expect(host.appended.at(-1)).toMatchObject({ data: { round: 3 } });
+		expect(host.notifications.map(entry => entry.message).join("\n")).toContain("late advisor finding reopened round 3/100");
 	});
 
 	it("answers /adversarial review with a verdict and spends a round when armed", async () => {

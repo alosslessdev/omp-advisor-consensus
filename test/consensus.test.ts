@@ -10,7 +10,9 @@ import {
 	findingKey,
 	lastUserText,
 	LEDGER_TYPE,
+	parseAdvisorContent,
 	parseReview,
+	pendingAdvisorFindings,
 	resolveConfig,
 	resolveEnvConfig,
 	scanEntries,
@@ -45,6 +47,19 @@ function assistant(id: string, text: string, stopReason = "stop") {
 		parentId: null,
 		timestamp: TS,
 		message: { role: "assistant", content: [{ type: "text", text }], stopReason },
+	};
+}
+
+function advisorNote(id: string, notes: Array<{ note: string; severity?: string; advisor?: string }>) {
+	return {
+		type: "custom_message",
+		id,
+		parentId: null,
+		timestamp: TS,
+		customType: "advisor",
+		content: "",
+		display: true,
+		details: { notes },
 	};
 }
 
@@ -242,6 +257,103 @@ describe("decision at the settle boundary", () => {
 		});
 	});
 
+	it("counts unanswered advisor notes as findings alongside the reviewer", () => {
+		const branch = entries(
+			user("u1"),
+			advisorNote("n0", [{ note: "already seen", severity: "concern" }]),
+			assistant("a1", "done"),
+			advisorNote("n1", [{ note: "missing test", severity: "blocker", advisor: "Arch" }]),
+		);
+		expect(pendingAdvisorFindings(branch)).toEqual([
+			{ text: "missing test", severity: "blocker", advisor: "Arch" },
+		]);
+
+		const decision = decideAtStop({
+			entries: branch,
+			config: config(),
+			lastAssistant: { text: "done" },
+			review: review(),
+		});
+		expect(decision).toMatchObject({
+			kind: "continue",
+			round: 1,
+			findings: [{ text: "missing test", severity: "blocker", advisor: "Arch" }],
+		});
+	});
+
+	it("ignores advisor stop calls and excludes the advisor when configured", () => {
+		const branch = entries(
+			user("u1"),
+			assistant("a1", "done"),
+			advisorNote("n1", [{ note: "[converged] all findings closed" }]),
+		);
+		expect(pendingAdvisorFindings(branch)).toEqual([]);
+
+		const withFinding = entries(
+			user("u1"),
+			assistant("a1", "done"),
+			advisorNote("n1", [{ note: "missing test", severity: "concern" }]),
+		);
+		expect(
+			decideAtStop({
+				entries: withFinding,
+				config: config({ includeAdvisor: false }),
+				lastAssistant: { text: "done" },
+				review: review(),
+			}),
+		).toMatchObject({ kind: "converged" });
+	});
+
+	it("merges duplicate findings from both sources at the higher severity", () => {
+		const branch = entries(
+			user("u1"),
+			assistant("a1", "done"),
+			advisorNote("n1", [{ note: "Missing test!", severity: "blocker" }]),
+		);
+		const decision = decideAtStop({
+			entries: branch,
+			config: config(),
+			lastAssistant: { text: "done" },
+			review: notMet({ text: "missing test", severity: "nit" }),
+		});
+		expect(decision).toMatchObject({
+			kind: "continue",
+			findings: [{ text: "Missing test!", severity: "blocker" }],
+		});
+	});
+
+	it("parses advisory XML when details are absent", () => {
+		expect(
+			parseAdvisorContent(
+				'<advisory advisor="Arch" severity="concern">\nWrap &lt;stdout&gt; writes\n</advisory>\n<advisory>plain nit</advisory>',
+			),
+		).toEqual([
+			{ text: "Wrap <stdout> writes", severity: "concern", advisor: "Arch" },
+			{ text: "plain nit", severity: "nit" },
+		]);
+	});
+
+	it("reopens a converged episode for a late advisor note", () => {
+		const branch = entries(
+			user("u1"),
+			ledger("l1", { v: 2, anchor: "u1", round: 2, seen: {}, settled: "converged" }),
+			assistant("a2", "done"),
+			advisorNote("n2", [{ note: "late gap", severity: "concern" }]),
+		);
+		expect(
+			decideAtStop({ entries: branch, config: config(), lastAssistant: { text: "done" }, review: review() }),
+		).toMatchObject({ kind: "ignore", reason: "settled" });
+		expect(
+			decideAtStop({
+				entries: branch,
+				config: config(),
+				lastAssistant: { text: "done" },
+				review: review(),
+				allowReopen: true,
+			}),
+		).toMatchObject({ kind: "continue", round: 3, ledger: { anchor: "u1" } });
+	});
+
 	it("anchors on the last user message", () => {
 		const branch = entries(
 			user("u1"),
@@ -300,7 +412,16 @@ describe("settings resolution", () => {
 	it("clamps config values and ignores unknown severities", () => {
 		expect(
 			resolveConfig({ enabled: true, maxRounds: 500, maxRepeats: 0, minSeverity: "severe", notify: "yes" }),
-		).toEqual({ enabled: true, minSeverity: "nit", maxRounds: 100, maxRepeats: 1, notify: true });
+		).toEqual({
+			enabled: true,
+			minSeverity: "nit",
+			maxRounds: 100,
+			maxRepeats: 1,
+			includeAdvisor: true,
+			forceSyncBacklog: true,
+			useSessionModel: true,
+			notify: true,
+		});
 	});
 
 	it("applies environment overrides for one process", () => {

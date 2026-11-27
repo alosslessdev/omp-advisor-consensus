@@ -21,6 +21,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@oh-my-pi/pi-coding-agent";
+import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import {
 	buildBudgetNotice,
 	buildConvergedNotice,
@@ -30,6 +31,7 @@ import {
 	buildReviewerUnavailableNotice,
 	buildRoundNotice,
 	buildStallNotice,
+	ADVISOR_CUSTOM_TYPE,
 	decideAtStop,
 	describeReview,
 	lastAssistantAnswer,
@@ -61,7 +63,19 @@ const STATUS_KEY = "advisor-consensus";
 const ARM_TYPE = "advisor-consensus-arm";
 /** Host stop-hook continuations we spend before switching to steered turns (host cap: 8). */
 const STOP_HOOK_ROUNDS = 6;
+/**
+ * An advisor note emitted after the loop settled is preserved as a card and
+ * never wakes the agent. Catch those for this long after `agent_end`.
+ */
+const CATCH_UP_WINDOW_MS = 10 * 60_000;
+const CATCH_UP_DELAY_MS = 250;
 type ManagedTimer = Parameters<ExtensionContext["clearTimer"]>[0];
+
+interface SettingHandle {
+	get(scope: unknown): unknown;
+	override(scope: unknown, value: unknown): void;
+	clearOverride(scope: unknown): void;
+}
 
 interface SessionState {
 	overrideEnabled: boolean | undefined;
@@ -87,8 +101,26 @@ interface SessionState {
 	lastStatusText: string | undefined;
 	warnedDisabled: boolean;
 	warnedUnavailable: boolean;
+	warnedAdvisorOff: boolean;
 	/** A reviewer turn is in flight; never start a second one. */
 	reviewing: boolean;
+	/** Live `advisor.enabled`; undefined when the host has no advisor settings. */
+	advisorEnabled: boolean | undefined;
+	syncPolicy: string | undefined;
+	forcedSync: boolean;
+	/** One attempt per session to switch the advisor on when the loop is armed. */
+	advisorForceAttempted: boolean;
+	forcedAdvisor: boolean;
+	/** `modelRoles.advisor` was set by the user, not by this plugin. */
+	advisorRoleConfigured: boolean | undefined;
+	/** Model selector this plugin pinned into `modelRoles.advisor`. */
+	pinnedAdvisorModel: string | undefined;
+	/** `configured` opts out of following the session model. */
+	modelMode: "session" | "configured";
+	/** When the current agent loop ended, for late-note catch-up. */
+	endedAt: number | undefined;
+	catchUpTimer: ManagedTimer | undefined;
+	overrideIncludeAdvisor: boolean | undefined;
 }
 
 const states = new Map<string, SessionState>();
@@ -117,7 +149,19 @@ function stateFor(sessionId: string): SessionState {
 			lastStatusText: undefined,
 			warnedDisabled: false,
 			warnedUnavailable: false,
+			warnedAdvisorOff: false,
 			reviewing: false,
+			advisorEnabled: undefined,
+			syncPolicy: undefined,
+			forcedSync: false,
+			advisorForceAttempted: false,
+			forcedAdvisor: false,
+			advisorRoleConfigured: undefined,
+			pinnedAdvisorModel: undefined,
+			modelMode: "session",
+			endedAt: undefined,
+			catchUpTimer: undefined,
+			overrideIncludeAdvisor: undefined,
 		};
 		states.set(sessionId, state);
 	}
@@ -215,6 +259,7 @@ function effectiveConfig(cwd: string, state: SessionState): ConsensusConfig {
 		maxRounds: state.overrideMaxRounds ?? base.maxRounds,
 		maxRepeats: state.overrideMaxRepeats ?? base.maxRepeats,
 		minSeverity: state.overrideMinSeverity ?? base.minSeverity,
+		includeAdvisor: state.overrideIncludeAdvisor ?? base.includeAdvisor,
 		notify: state.overrideNotify ?? base.notify,
 	};
 }
@@ -233,6 +278,113 @@ function readArmState(entries: readonly SessionEntry[]): boolean | undefined {
 		return typeof data.armed === "boolean" ? data.armed : undefined;
 	}
 	return undefined;
+}
+
+/**
+ * Host settings come from the runtime registry, not from the plugin lockfile.
+ * Looked up lazily: extensions load before the settings panel mounts, and the
+ * registry is a union of typed handles, so this one call site narrows both to
+ * the shared structural surface instead of re-checking each variant.
+ */
+function advisorSettings(): {
+	enabled: SettingHandle | undefined;
+	sync: SettingHandle | undefined;
+	roles: SettingHandle | undefined;
+} {
+	const enabled = lookup("advisor.enabled") as SettingHandle | undefined;
+	const sync = lookup("advisor.syncBacklog") as SettingHandle | undefined;
+	const roles = lookup("modelRoles") as SettingHandle | undefined;
+	return { enabled, sync, roles };
+}
+
+/** Current `modelRoles` record, narrowed from the settings scope. */
+function readModelRoles(handle: SettingHandle, scope: unknown): Record<string, string> {
+	const roles: Record<string, string> = {};
+	const value = handle.get(scope);
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return roles;
+	for (const [name, selector] of Object.entries(value)) {
+		if (typeof selector === "string") roles[name] = selector;
+	}
+	return roles;
+}
+
+/**
+ * Default the advisor to the session model.
+ *
+ * The advisor role normally resolves through the `slow` chain, which is a
+ * different (usually stronger, slower and costlier) model than the one the user
+ * is driving. For a loop where the model argues with itself, pin the role to
+ * the live session model — unless the user configured that role or a WATCHDOG
+ * roster entry names its own model (roster models win and are untouched).
+ */
+function syncAdvisorModel(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	state: SessionState,
+	config: ConsensusConfig,
+): void {
+	const roles = advisorSettings().roles;
+	if (!roles) return;
+	if (state.advisorRoleConfigured === undefined) {
+		// Per-role, not `isConfigured`: the `modelRoles` record is "configured"
+		// as soon as any role is set, and most configs set `default`.
+		state.advisorRoleConfigured = readModelRoles(roles, pi.pi.settings).advisor !== undefined;
+	}
+	const followSession = config.useSessionModel && state.modelMode === "session" && !state.advisorRoleConfigured;
+	const selector = followSession && ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+	if (selector === state.pinnedAdvisorModel) return;
+	if (!selector) {
+		if (state.pinnedAdvisorModel) {
+			roles.clearOverride(pi.pi.settings);
+			state.pinnedAdvisorModel = undefined;
+		}
+		return;
+	}
+	roles.override(pi.pi.settings, { ...readModelRoles(roles, pi.pi.settings), advisor: selector });
+	state.pinnedAdvisorModel = selector;
+	pi.logger.debug("advisor-consensus pinned advisor model", { model: selector });
+}
+
+/** Re-read `advisor.enabled` / `advisor.syncBacklog`: `/advisor on` mid-session is picked up. */
+function refreshAdvisorState(pi: ExtensionAPI, state: SessionState): void {
+	const host = advisorSettings();
+	const enabled = host.enabled?.get(pi.pi.settings);
+	state.advisorEnabled = typeof enabled === "boolean" ? enabled : undefined;
+	const sync = host.sync?.get(pi.pi.settings);
+	state.syncPolicy = typeof sync === "string" ? sync : undefined;
+}
+
+/**
+ * Arming a loop with no advisor still has the reviewer, but the advisor notes
+ * are useful: turn the advisor on for this session (runtime override, not
+ * persisted) when it is off. One attempt per session: if the user turns it back
+ * off, the plugin does not fight them.
+ */
+function ensureAdvisor(
+	pi: ExtensionAPI,
+	state: SessionState,
+	ctx: ExtensionContext,
+	config: ConsensusConfig,
+): void {
+	const host = advisorSettings();
+	const enabled = host.enabled?.get(pi.pi.settings);
+	state.advisorEnabled = typeof enabled === "boolean" ? enabled : undefined;
+	if (!config.enabled || !config.includeAdvisor || state.advisorEnabled !== false || state.advisorForceAttempted) {
+		return;
+	}
+	state.advisorForceAttempted = true;
+	if (!host.enabled) return;
+	host.enabled.override(pi.pi.settings, true);
+	state.forcedAdvisor = true;
+	refreshAdvisorState(pi, state);
+	const nowEnabled = host.enabled?.get(pi.pi.settings) === true;
+	pi.logger.debug("advisor-consensus forced advisor on", { advisorEnabled: nowEnabled });
+	if (nowEnabled) {
+		ctx.ui.notify(
+			"advisor-consensus: advisor was off; enabled it for this session so its notes supplement the reviewer.",
+			"info",
+		);
+	}
 }
 
 /** Persistent status-line text: the effective budget first, live state second. */
@@ -267,9 +419,12 @@ function updateStatus(
 
 function describe(state: SessionState, config: ConsensusConfig, reviewerAvailable: boolean): string {
 	const mode = state.paused ? "paused" : config.enabled ? "on" : "off";
+	const advisor =
+		state.advisorEnabled === true ? "on" : state.advisorEnabled === false ? "off" : "unknown";
 	const lines = [
 		`mode: ${mode}`,
 		`reviewer: ${reviewerAvailable ? "own ephemeral turn (session model)" : "unavailable on this host"}`,
+		`advisor: ${config.includeAdvisor ? advisor : "excluded"}${state.syncPolicy ? ` · syncBacklog ${state.syncPolicy}${state.forcedSync ? " (pinned)" : ""}` : ""}`,
 		`config: enabled=${config.enabled} severity>=${config.minSeverity} rounds=${config.maxRounds} (soft) repeats=${config.maxRepeats} notify=${config.notify}`,
 		`episode: round ${state.episodeRound}/${config.maxRounds}${state.stalls > 0 ? ` · stall ${state.stalls}` : ""}`,
 		`converged this session: ${state.convergedCount}`,
@@ -332,6 +487,24 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 		}
 		ctx.ui.notify(buildReviewerFailedNotice(failure), "warning");
 		return undefined;
+	};
+
+	/** Drop every runtime override this plugin placed on the advisor subsystem. */
+	const releaseAdvisorOverrides = (state: SessionState): void => {
+		const host = advisorSettings();
+		if (state.forcedSync) {
+			host.sync?.clearOverride(pi.pi.settings);
+			state.forcedSync = false;
+		}
+		if (state.pinnedAdvisorModel) {
+			host.roles?.clearOverride(pi.pi.settings);
+			state.pinnedAdvisorModel = undefined;
+		}
+		if (state.forcedAdvisor) {
+			host.enabled?.clearOverride(pi.pi.settings);
+			state.forcedAdvisor = false;
+		}
+		state.advisorForceAttempted = false;
 	};
 
 	const steerRound = (state: SessionState, config: ConsensusConfig, decision: ContinueDecision): void => {
@@ -413,6 +586,48 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 		}
 	};
 
+	/**
+	 * A note the advisor raises after the loop settled never becomes a turn on
+	 * its own: a preserved card just sits in the transcript. If the loop is armed
+	 * and the session is idle, re-run the reviewer with the late note in scope;
+	 * an unmet goal reopens the converged episode.
+	 */
+	const catchUpLateNote = async (ctx: ExtensionContext): Promise<void> => {
+		if (ctx.agent.kind !== "main") return;
+		const state = stateFor(ctx.sessionManager.getSessionId());
+		const config = effectiveConfig(ctx.cwd, state);
+		if (!config.enabled || !config.includeAdvisor || state.paused || state.reviewing) return;
+		if (state.endedAt === undefined || Date.now() - state.endedAt > CATCH_UP_WINDOW_MS) return;
+		if (ctx.sessionModes?.getState().plan.status === "active") return;
+		if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+
+		const entries = ctx.sessionManager.getBranch();
+		state.reviewing = true;
+		let review: ReviewResult | undefined;
+		try {
+			review = await runReview(ctx, state);
+		} finally {
+			state.reviewing = false;
+		}
+		if (!review) return;
+		const decision = decideAtStop({
+			entries,
+			config,
+			lastAssistant: lastAssistantAnswer(entries),
+			review,
+			allowReopen: true,
+		});
+		if (decision.kind !== "continue") return;
+		if (config.notify) {
+			ctx.ui.notify(
+				`advisor-consensus: late advisor finding reopened round ${decision.round}/${config.maxRounds}`,
+				"warning",
+			);
+		}
+		recordRound(ctx, state, config, decision);
+		steerRound(state, config, decision);
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
 		if (ctx.agent.kind !== "main") return;
 		const sessionId = ctx.sessionManager.getSessionId();
@@ -450,11 +665,28 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 			state.warnedUnavailable = true;
 			ctx.ui.notify(buildReviewerUnavailableNotice(), "warning");
 		}
+		const host = advisorSettings();
+		refreshAdvisorState(pi, state);
+		ensureAdvisor(pi, state, ctx, config);
+		if (config.includeAdvisor && state.advisorEnabled === false && !state.warnedAdvisorOff) {
+			state.warnedAdvisorOff = true;
+			ctx.ui.notify(
+				"advisor-consensus: the advisor is off, so only the reviewer gates the loop. Run /advisor on to add its notes.",
+				"info",
+			);
+		}
+		if (config.includeAdvisor && state.advisorEnabled === true && config.forceSyncBacklog && state.syncPolicy !== "strict") {
+			host.sync?.override(pi.pi.settings, "strict");
+			state.syncPolicy = "strict";
+			state.forcedSync = true;
+		}
+		syncAdvisorModel(pi, ctx, state, config);
 	});
 
 	pi.on("agent_start", (_event, ctx) => {
 		if (ctx.agent.kind !== "main") return;
 		const state = stateFor(ctx.sessionManager.getSessionId());
+		state.endedAt = undefined;
 		// The first `agent_start` can precede the user message reaching the branch,
 		// so only a real prompt id can open a new stop-hook window.
 		const anchor = scanEntries(ctx.sessionManager.getBranch()).lastUserEntryId;
@@ -470,6 +702,7 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 	pi.on("agent_end", (_event, ctx) => {
 		if (ctx.agent.kind !== "main") return;
 		const state = stateFor(ctx.sessionManager.getSessionId());
+		state.endedAt = Date.now();
 		const pending = state.pendingRound;
 		if (!pending) return;
 		const config = effectiveConfig(ctx.cwd, state);
@@ -477,10 +710,24 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 		steerRound(state, config, pending);
 	});
 
+	pi.on("message_end", (event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
+		const message = event.message;
+		if (message.role !== "custom" || message.customType !== ADVISOR_CUSTOM_TYPE) return;
+		const state = stateFor(ctx.sessionManager.getSessionId());
+		if (state.catchUpTimer) return;
+		state.catchUpTimer = ctx.setTimeout(() => {
+			state.catchUpTimer = undefined;
+			return catchUpLateNote(ctx);
+		}, CATCH_UP_DELAY_MS);
+	});
+
 	pi.on("session_shutdown", async (_event, ctx) => {
 		if (ctx.agent.kind !== "main") return;
 		const state = states.get(ctx.sessionManager.getSessionId());
 		if (state?.refreshTimer) ctx.clearTimer(state.refreshTimer);
+		if (state?.catchUpTimer) ctx.clearTimer(state.catchUpTimer);
+		if (state) releaseAdvisorOverrides(state);
 		states.delete(ctx.sessionManager.getSessionId());
 	});
 
@@ -490,6 +737,19 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 		const config = effectiveConfig(ctx.cwd, state);
 		if (!config.enabled || state.paused || state.reviewing) return;
 		if (ctx.sessionModes?.getState().plan.status === "active") return;
+
+		const host = advisorSettings();
+		const advisorWasOff = state.advisorEnabled === false;
+		refreshAdvisorState(pi, state);
+		if (advisorWasOff && state.advisorEnabled === true && config.notify) {
+			ctx.ui.notify("advisor-consensus: advisor detected — its notes now supplement the reviewer.", "info");
+		}
+		if (config.includeAdvisor && state.advisorEnabled === true && config.forceSyncBacklog && state.syncPolicy !== "strict") {
+			host.sync?.override(pi.pi.settings, "strict");
+			state.syncPolicy = "strict";
+			state.forcedSync = true;
+		}
+		syncAdvisorModel(pi, ctx, state, config);
 
 		const entries = ctx.sessionManager.getBranch();
 		const lastAssistant = lastAssistantAnswer(entries);
@@ -551,8 +811,22 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 				pi.appendEntry(ARM_TYPE, { armed: true });
 				const config = effectiveConfig(ctx.cwd, state);
 				updateStatus(ctx, state, config, "armed");
+				const host = advisorSettings();
+				refreshAdvisorState(pi, state);
+				ensureAdvisor(pi, state, ctx, config);
+				if (
+					config.includeAdvisor &&
+					host.enabled?.get(pi.pi.settings) === true &&
+					config.forceSyncBacklog &&
+					state.syncPolicy !== "strict"
+				) {
+					host.sync?.override(pi.pi.settings, "strict");
+					state.syncPolicy = "strict";
+					state.forcedSync = true;
+				}
+				syncAdvisorModel(pi, ctx, state, config);
 				ctx.ui.notify(
-					`advisor-consensus: adversarial loop on · own reviewer · soft ${config.maxRounds} rounds · repeats ${config.maxRepeats}`,
+					`advisor-consensus: adversarial loop on · own reviewer${config.includeAdvisor ? " + advisor" : ""} · soft ${config.maxRounds} rounds · repeats ${config.maxRepeats}`,
 					"info",
 				);
 				if (!ctx.runEphemeralTurn) {
@@ -567,6 +841,8 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 				state.pendingRound = undefined;
 				state.stalls = 0;
 				pi.appendEntry(ARM_TYPE, { armed: false });
+				releaseAdvisorOverrides(state);
+				state.advisorEnabled = undefined;
 				refresh();
 				const scan = scanEntries(ctx.sessionManager.getBranch());
 				const anchor = scan.lastUserEntryId ?? scan.ledger?.anchor ?? "session";
@@ -642,6 +918,25 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 				await reviewAndAct(ctx, state, config, review);
 			};
 
+			const setAdvisorEnabled = (enabled: boolean): void => {
+				state.overrideIncludeAdvisor = enabled;
+				const config = effectiveConfig(ctx.cwd, state);
+				if (!enabled) {
+					ctx.ui.notify(
+						"advisor-consensus: advisor notes ignored; the reviewer alone gates the loop.",
+						"info",
+					);
+				} else {
+					refreshAdvisorState(pi, state);
+					ensureAdvisor(pi, state, ctx, config);
+					ctx.ui.notify(
+						"advisor-consensus: advisor notes count as findings alongside the reviewer.",
+						"info",
+					);
+				}
+				refresh();
+			};
+
 			/**
 			 * Interactive editor for the live loop settings. Values are session
 			 * overrides; durable values come from plugin settings.
@@ -659,6 +954,10 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 							description: "Re-raises of one finding before stall pressure starts (1..10)",
 						},
 						{ label: `Min severity: ${config.minSeverity}`, description: "Lowest finding severity that keeps the loop running" },
+						{
+							label: `Advisor notes: ${config.includeAdvisor ? "on" : "off"}`,
+							description: "Count unanswered advisor findings alongside the reviewer",
+						},
 						{ label: `Notify: ${config.notify ? "on" : "off"}`, description: "Toast each round, convergence, stall, budget" },
 						{ label: "Done", description: "Keep these session values" },
 					]);
@@ -672,6 +971,10 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 					if (choice.startsWith("Max repeats")) {
 						const answer = await ctx.ui.input("Max repeats (1..10)", String(config.maxRepeats));
 						if (answer !== undefined) setRepeats(answer);
+						continue;
+					}
+					if (choice.startsWith("Advisor notes")) {
+						setAdvisorEnabled(!config.includeAdvisor);
 						continue;
 					}
 					if (choice.startsWith("Min severity")) {
@@ -742,7 +1045,7 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 				case "config":
 					if (ctx.mode !== "tui") {
 						ctx.ui.notify(
-							"advisor-consensus: interactive editor is TUI-only. Use on/off/pause/resume/review, max N, repeats N, severity S.",
+							"advisor-consensus: interactive editor is TUI-only. Use on/off/pause/resume/review, max N, repeats N, severity S, advisor on|off.",
 							"info",
 						);
 						return;
@@ -760,9 +1063,18 @@ export default function advisorConsensus(pi: ExtensionAPI) {
 				case "severity":
 					setSeverity(value);
 					return;
+				case "advisor": {
+					const mode = value.toLowerCase();
+					if (mode !== "on" && mode !== "off") {
+						ctx.ui.notify("advisor-consensus: /adversarial advisor on|off", "warning");
+						return;
+					}
+					setAdvisorEnabled(mode === "on");
+					return;
+				}
 				default:
 					ctx.ui.notify(
-						"advisor-consensus: /adversarial [status|on|off|pause|resume|review|config|max N|repeats N|severity S]",
+						"advisor-consensus: /adversarial [status|on|off|pause|resume|review|config|max N|repeats N|severity S|advisor on|off]",
 						"info",
 					);
 			}

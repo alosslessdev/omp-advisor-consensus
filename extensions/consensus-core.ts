@@ -23,6 +23,20 @@ const SEVERITY_RANK: Readonly<Record<Severity, number>> = {
 
 export const SEVERITIES: readonly Severity[] = ["nit", "concern", "blocker"];
 
+/** Custom message type the host uses for advisor notes (steered and preserved cards). */
+export const ADVISOR_CUSTOM_TYPE = "advisor";
+
+/**
+ * The advisor's reserved stop call: advisor tools come from the built-in
+ * catalog, so a note that starts with this token is `advise`'s agreement
+ * signal, not a finding.
+ */
+export const STOP_SIGNAL = "[converged]";
+
+export function isStopSignal(text: string): boolean {
+	return text.trim().toLowerCase().startsWith(STOP_SIGNAL);
+}
+
 /** Session custom-entry type carrying this plugin's per-episode ledger. */
 export const LEDGER_TYPE = "advisor-consensus";
 /** Journal purpose for reviewer side turns. */
@@ -46,6 +60,12 @@ export interface ConsensusConfig {
 	maxRounds: number;
 	/** Re-raises of one finding before the next round runs under stall pressure. */
 	maxRepeats: number;
+	/** Use advisor notes as a second findings source while the advisor is on. */
+	includeAdvisor: boolean;
+	/** Pin `advisor.syncBacklog` to `strict` so a review is never still in flight at settle. */
+	forceSyncBacklog: boolean;
+	/** Default the advisor's model to the session's live model unless it is configured. */
+	useSessionModel: boolean;
 	/** Toast on each round, convergence, stall, and budget crossing. */
 	notify: boolean;
 }
@@ -56,6 +76,9 @@ export const DEFAULT_CONFIG: ConsensusConfig = {
 	minSeverity: "nit",
 	maxRounds: 100,
 	maxRepeats: 3,
+	includeAdvisor: true,
+	forceSyncBacklog: true,
+	useSessionModel: true,
 	notify: true,
 };
 
@@ -63,9 +86,11 @@ export const DEFAULT_CONFIG: ConsensusConfig = {
 export const MAX_ROUNDS_CEILING = 100;
 
 export interface ReviewerFinding {
-	/** What is still unmet, in the reviewer's words. */
+	/** What is still unmet, in the reviewer's (or advisor's) words. */
 	text: string;
 	severity: Severity;
+	/** Named roster advisor, when the finding came from the advisor subsystem. */
+	advisor?: string;
 }
 
 export interface ReviewResult {
@@ -134,6 +159,106 @@ export function findingKey(text: string): string {
 		.toLowerCase()
 		.replace(/[^\p{L}\p{N}]+/gu, " ")
 		.trim();
+}
+
+function decodeEntities(value: string): string {
+	return value
+		.replaceAll("&lt;", "<")
+		.replaceAll("&gt;", ">")
+		.replaceAll("&quot;", '"')
+		.replaceAll("&apos;", "'")
+		.replaceAll("&#39;", "'")
+		.replaceAll("&amp;", "&");
+}
+
+/**
+ * Parser for advisor message bodies. `details.notes` is authoritative; this
+ * fallback keeps older transcripts (and hosts that render without details)
+ * usable.
+ */
+export function parseAdvisorContent(content: string): ReviewerFinding[] {
+	const findings: ReviewerFinding[] = [];
+	const pattern = /<advisory([^>]*)>([\s\S]*?)<\/advisory>/g;
+	for (const match of content.matchAll(pattern)) {
+		const attributes = match[1] ?? "";
+		const advisor = /\badvisor="([^"]*)"/.exec(attributes)?.[1];
+		const severity = /\bseverity="([^"]*)"/.exec(attributes)?.[1];
+		const text = decodeEntities(match[2] ?? "").trim();
+		if (!text) continue;
+		findings.push({
+			text,
+			severity: normalizeSeverity(severity),
+			...(advisor ? { advisor: decodeEntities(advisor) } : {}),
+		});
+	}
+	return findings;
+}
+
+function notesFromDetails(details: unknown): ReviewerFinding[] {
+	if (typeof details !== "object" || details === null || Array.isArray(details)) return [];
+	if (!("notes" in details) || !Array.isArray(details.notes)) return [];
+	const findings: ReviewerFinding[] = [];
+	for (const note of details.notes) {
+		if (typeof note !== "object" || note === null) continue;
+		if (!("note" in note) || typeof note.note !== "string") continue;
+		const text = note.note.trim();
+		if (!text) continue;
+		const severity = "severity" in note ? note.severity : undefined;
+		const advisor = "advisor" in note ? note.advisor : undefined;
+		findings.push({
+			text,
+			severity: normalizeSeverity(severity),
+			...(typeof advisor === "string" && advisor ? { advisor } : {}),
+		});
+	}
+	return findings;
+}
+
+/** Advisor findings carried by one session entry, in transcript order. */
+export function findingsFromEntry(entry: SessionEntry): ReviewerFinding[] {
+	if (entry.type !== "custom_message" || entry.customType !== ADVISOR_CUSTOM_TYPE) return [];
+	const fromDetails = notesFromDetails(entry.details);
+	if (fromDetails.length > 0) return fromDetails;
+	const content = typeof entry.content === "string" ? entry.content : "";
+	return content.includes("<advisory") ? parseAdvisorContent(content) : [];
+}
+
+/**
+ * Advisor notes the agent has not answered: notes that landed after the last
+ * assistant message. Notes delivered before it were already visible to the
+ * model while it produced that message. Stop calls are not findings.
+ */
+export function pendingAdvisorFindings(
+	entries: readonly SessionEntry[],
+	scan = scanEntries(entries),
+): ReviewerFinding[] {
+	const findings: ReviewerFinding[] = [];
+	for (let index = scan.lastAssistant + 1; index < entries.length; index++) {
+		const entry = entries[index]!;
+		findings.push(...findingsFromEntry(entry).filter(finding => !isStopSignal(finding.text)));
+	}
+	return findings;
+}
+
+/** Union by normalized text; the higher severity and an advisor label survive. */
+function mergeFindings(findings: readonly ReviewerFinding[]): ReviewerFinding[] {
+	const byKey = new Map<string, ReviewerFinding>();
+	for (const finding of findings) {
+		const key = findingKey(finding.text);
+		const existing = byKey.get(key);
+		if (!existing) {
+			byKey.set(key, finding);
+			continue;
+		}
+		byKey.set(key, {
+			...existing,
+			...finding,
+			severity:
+				SEVERITY_RANK[finding.severity] > SEVERITY_RANK[existing.severity] ? finding.severity : existing.severity,
+			...(finding.advisor ?? existing.advisor ? { advisor: finding.advisor ?? existing.advisor } : {}),
+		});
+	}
+	return [...byKey.values()];
 }
 
 function pruneSeen(seen: Record<string, number>, limit = 512): Record<string, number> {
@@ -345,6 +470,8 @@ export function decideAtStop(input: {
 	config: ConsensusConfig;
 	lastAssistant: { text: string; stopReason?: string } | undefined;
 	review: ReviewResult | undefined;
+	/** Catch-up: a late advisor note may reopen an episode the reviewer closed. */
+	allowReopen?: boolean;
 }): StopDecision {
 	const { entries, config, lastAssistant, review } = input;
 	const scan = scanEntries(entries);
@@ -355,13 +482,22 @@ export function decideAtStop(input: {
 	if (lastAssistant?.stopReason === "error" || lastAssistant?.stopReason === "aborted") {
 		return { kind: "ignore", reason: "error-turn", round };
 	}
-	if (active?.settled) return { kind: "ignore", reason: "settled", round };
+	if (active?.settled && !(input.allowReopen === true && active.settled === "converged")) {
+		return { kind: "ignore", reason: "settled", round };
+	}
 	if (!review) return { kind: "ignore", reason: "no-review", round };
 
-	const findings = review.findings.filter(finding => meetsMinSeverity(finding.severity, config.minSeverity));
-	// A list of findings always means unmet work, even if the verdict claims
-	// otherwise. Findings filtered out by the severity floor are not loop-worthy,
-	// but a bare `goal_met: false` with no findings still keeps the loop.
+	const reviewerFindings = review.findings.filter(finding =>
+		meetsMinSeverity(finding.severity, config.minSeverity),
+	);
+	// The advisor is a second, independent source: its unanswered notes count as
+	// findings even when the reviewer would accept the goal. Findings filtered
+	// out by the severity floor are not loop-worthy, but a bare
+	// `goal_met: false` with no findings still keeps the loop.
+	const advisorFindings = config.includeAdvisor
+		? pendingAdvisorFindings(entries, scan).filter(finding => meetsMinSeverity(finding.severity, config.minSeverity))
+		: [];
+	const findings = mergeFindings([...reviewerFindings, ...advisorFindings]);
 	const goalMet = findings.length === 0 && (review.findings.length > 0 || review.goalMet);
 
 	if (goalMet) {
@@ -471,7 +607,9 @@ export function buildRemediationPrompt(
 			"Open findings:",
 			...findings.map(
 				(finding, index) =>
-					`${index + 1}. [${finding.severity}] ${finding.text.replace(/\s+/g, " ").trim()}`,
+					`${index + 1}. [${finding.severity}]${finding.advisor ? ` advisor="${finding.advisor}"` : ""} ${finding.text
+						.replace(/\s+/g, " ")
+						.trim()}`,
 			),
 			"",
 			"For each finding either fix it (and verify the fix) or rebut it with new, concrete evidence:",
@@ -577,6 +715,9 @@ export function resolveConfig(settings: Record<string, unknown>): ConsensusConfi
 		minSeverity: severity,
 		maxRounds: readInt("maxRounds", 1, MAX_ROUNDS_CEILING, DEFAULT_CONFIG.maxRounds),
 		maxRepeats: readInt("maxRepeats", 1, 10, DEFAULT_CONFIG.maxRepeats),
+		includeAdvisor: readBool("includeAdvisor", DEFAULT_CONFIG.includeAdvisor),
+		forceSyncBacklog: readBool("forceSyncBacklog", DEFAULT_CONFIG.forceSyncBacklog),
+		useSessionModel: readBool("useSessionModel", DEFAULT_CONFIG.useSessionModel),
 		notify: readBool("notify", DEFAULT_CONFIG.notify),
 	};
 }
@@ -606,5 +747,11 @@ export function resolveEnvConfig(env: Record<string, string | undefined>): Parti
 	if (repeats !== undefined) partial.maxRepeats = Math.min(10, Math.max(1, repeats));
 	const notify = bool(env.OMP_ADVISOR_CONSENSUS_NOTIFY);
 	if (notify !== undefined) partial.notify = notify;
+	const includeAdvisor = bool(env.OMP_ADVISOR_CONSENSUS_INCLUDE_ADVISOR);
+	if (includeAdvisor !== undefined) partial.includeAdvisor = includeAdvisor;
+	const forceSync = bool(env.OMP_ADVISOR_CONSENSUS_FORCE_SYNC_BACKLOG);
+	if (forceSync !== undefined) partial.forceSyncBacklog = forceSync;
+	const sessionModel = bool(env.OMP_ADVISOR_CONSENSUS_USE_SESSION_MODEL);
+	if (sessionModel !== undefined) partial.useSessionModel = sessionModel;
 	return partial;
 }
